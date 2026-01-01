@@ -34,6 +34,32 @@ English README: [README.md](README.md)
 5. 点击 **Begin** 开始。用户实验模式需手动选择 A/B 音频并给出 1–5 的不确定度等级；自动测试模式由系统自动迭代。
 6. 会话完成后，数据会导出到 `data/YYYYMMDD_序号/` 下的 `session.json` 与 `log.txt`。
 
+## 会话输出 (session.json)
+导出文件保留旧字段，并新增结构化摘要：
+- `final_summary`：GP 后验均值推荐点、搜索方法、参数边界、后验不确定性，以及（按模式）验证/测试指标。
+- `metrics`：按迭代对齐的数组，如 `info_gain` 与 `posterior_best_mean`。
+- `metadata`：会话模式、计划/完成查询次数、完成状态。
+
+示例片段：
+```json
+{
+  "final_summary": {
+    "recommended_params": [61.2, 58.7, 64.0, 55.9],
+    "recommended_score": 0.84,
+    "method": "lbfgsb",
+    "bounds": {"amplitude": [20.0, 100.0], "frequency": [20.0, 100.0], "density": [20.0, 100.0], "gradient": [20.0, 100.0]},
+    "posterior_uncertainty": {"avg_pred_var": 0.12, "max_pred_var": 0.41},
+    "validation": {"rounds": 3, "win_rate": 0.67, "records": [{"round": 1, "choice": "A", "level": 4}]},
+    "test_metrics": {"pearson": 0.71, "spearman": 0.68, "regret": 0.09, "distance_to_optimum": 6.4}
+  },
+  "metrics": {
+    "info_gain": [0.21, 0.19, 0.17],
+    "posterior_best_mean": [0.41, 0.53, 0.61]
+  },
+  "metadata": {"mode": "User Study", "n_queries_planned": 35, "n_queries_completed": 35, "status": "complete"}
+}
+```
+
 ## 目录结构
 ```
 .
@@ -55,6 +81,7 @@ English README: [README.md](README.md)
         │   ├── audio_gp.py
         │   ├── gaussian_process.py
         │   └── math_utils.py
+        ├── evaluation.py
         └── interface
             ├── __init__.py
             ├── session.py

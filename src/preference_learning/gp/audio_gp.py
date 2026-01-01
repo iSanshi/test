@@ -93,5 +93,50 @@ class AudioPreferenceGaussianProcess(GaussianProcess):
 
         return best_result, best_info_gain
 
+    def find_recommendation(
+        self, n_restarts: int = 5, n_samples: int = 5000
+    ) -> Tuple[np.ndarray, float, str]:
+        """Return the best parameters by maximizing the GP posterior mean."""
+
+        def negative_mean(x: np.ndarray) -> float:
+            mu = self.mean1pt(x)
+            return -float(mu[0] if isinstance(mu, (list, tuple, np.ndarray)) else mu)
+
+        bounds = [(0.0, 1.0)] * self.dim
+        best_result = None
+        best_mean = -np.inf
+        method = "lbfgsb"
+
+        for _ in range(max(n_restarts, 1)):
+            base_point = self.initialPoint
+            perturbation = np.random.uniform(-0.3, 0.3, self.dim)
+            start = np.clip(base_point + perturbation, 0.0, 1.0)
+            try:
+                opt_res = minimize(
+                    negative_mean,
+                    x0=start,
+                    bounds=bounds,
+                    method="L-BFGS-B",
+                    options={"ftol": 1e-9, "gtol": 1e-6},
+                )
+                mean_val = -opt_res.fun
+                if np.isfinite(mean_val) and mean_val > best_mean:
+                    best_mean = mean_val
+                    best_result = opt_res.x
+            except Exception:
+                continue
+
+        if best_result is None:
+            method = "random_search"
+            n_samples = max(1, int(n_samples))
+            samples = np.random.uniform(0.0, 1.0, size=(n_samples, self.dim))
+            mu_vals = self.mean1pt(samples, eval=True)
+            mu_vals = np.asarray(mu_vals, dtype=float).reshape(-1)
+            idx = int(np.argmax(mu_vals))
+            best_result = samples[idx]
+            best_mean = float(mu_vals[idx])
+
+        return self.denormalize_parameters(best_result), float(best_mean), method
+
     # Backwards-compatible alias
     find_optimal_query_4d = find_optimal_query

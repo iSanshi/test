@@ -11,14 +11,24 @@ from enum import Enum
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.stats import spearmanr
 
 from ..audio import AudioGenerator
 from ..gp import AudioPreferenceGaussianProcess
+from ..evaluation import (
+    correlation_metrics,
+    pairwise_accuracy,
+    posterior_mean,
+    posterior_uncertainty,
+    test_metrics,
+    top_k_by_mean,
+    validation_summary,
+)
 
 
 LEVEL_TO_WEIGHT = {1: 0.1, 2: 0.3, 3: 0.5, 4: 0.8, 5: 1.0}
 DIFF_THRESHOLDS = [0.01, 0.05, 0.10, 0.20]
+DEFAULT_SESSION_SEED = 123
+DEFAULT_VALIDATION_ROUNDS = 3
 
 
 def level_from_diff_legacy(diff_abs_norm: float) -> int:
@@ -40,6 +50,11 @@ def moving_average(arr: Sequence[float], k: int = 5) -> np.ndarray:
 class SessionMode(Enum):
     USER = "User Study"
     TEST = "Test"
+
+
+class SessionPhase(Enum):
+    TRAINING = "Training"
+    VALIDATION = "Validation"
 
 
 class GroundTruthKind(Enum):
@@ -79,6 +94,14 @@ class TestQueryRecord:
 class Recommendation:
     parameters: Optional[np.ndarray] = None
     mean_value: Optional[float] = None
+    method: Optional[str] = None
+
+
+@dataclass
+class ValidationRecord:
+    round_index: int
+    choice: str
+    level: int
 
 
 @dataclass
@@ -88,6 +111,10 @@ class SessionState:
     current_iteration: int = 0
     running: bool = False
     gt_kind: GroundTruthKind = GroundTruthKind.GAUSSIAN_CENTER
+    seed: Optional[int] = None
+    phase: SessionPhase = SessionPhase.TRAINING
+    validation_rounds: int = DEFAULT_VALIDATION_ROUNDS
+    validation_index: int = 0
 
 
 class PreferenceSession:
@@ -116,7 +143,11 @@ class PreferenceSession:
         self.best_so_far_history: List[float] = []
         self.rec_distance_history: List[float] = []
         self.rec_history_phys: List[np.ndarray] = []
+        self.posterior_best_mean_history: List[float] = []
         self.test_query_history: List[TestQueryRecord] = []
+        self.validation_records: List[ValidationRecord] = []
+        self.validation_recommended: Optional[np.ndarray] = None
+        self.validation_competitor: Optional[np.ndarray] = None
 
         # Test evaluation
         self.eval_pts_phys: Optional[List[np.ndarray]] = None
@@ -151,18 +182,42 @@ class PreferenceSession:
         self.best_so_far_history.clear()
         self.rec_distance_history.clear()
         self.rec_history_phys.clear()
+        self.posterior_best_mean_history.clear()
         self.test_query_history.clear()
+        self.validation_records.clear()
+        self.validation_recommended = None
+        self.validation_competitor = None
         self.eval_pts_phys = None
         self.eval_gt = None
 
         self.state.current_iteration = 0
         self.state.running = False
+        self.state.seed = None
+        self.state.phase = SessionPhase.TRAINING
+        self.state.validation_rounds = DEFAULT_VALIDATION_ROUNDS
+        self.state.validation_index = 0
 
-    def start(self, mode: SessionMode, max_iterations: int, gt_label: str) -> None:
+    def _set_seed(self, seed: Optional[int]) -> None:
+        chosen = DEFAULT_SESSION_SEED if seed is None else int(seed)
+        self.state.seed = chosen
+        np.random.seed(chosen)
+
+    def start(
+        self,
+        mode: SessionMode,
+        max_iterations: int,
+        gt_label: str,
+        seed: Optional[int] = None,
+        validation_rounds: int = DEFAULT_VALIDATION_ROUNDS,
+    ) -> None:
         self.reset()
+        self._set_seed(seed)
         self.state.mode = mode
         self.state.max_iterations = max(1, max_iterations)
         self.state.gt_kind = GroundTruthKind.from_label(gt_label)
+        self.state.phase = SessionPhase.TRAINING
+        self.state.validation_rounds = max(0, int(validation_rounds))
+        self.state.validation_index = 0
 
         initial_point = [0.5, 0.5, 0.5, 0.5]
         self.gp = AudioPreferenceGaussianProcess(initial_point=initial_point, theta=0.5, noise_level=0.1)
@@ -175,17 +230,65 @@ class PreferenceSession:
         self.ideal_phys = np.array(self._ideal_for_gt_func(self.state.gt_kind), dtype=float)
 
         if self.state.mode is SessionMode.TEST:
-            self._build_eval_set(n=800, seed=123)
+            self._build_eval_set(n=800)
 
     def stop(self) -> None:
         self.state.running = False
         self._stop_event.set()
 
+    def training_complete(self) -> bool:
+        return self.state.current_iteration >= self.state.max_iterations
+
+    def validation_complete(self) -> bool:
+        return self.state.validation_index >= self.state.validation_rounds
+
+    def is_complete(self) -> bool:
+        if self.state.mode is SessionMode.USER:
+            if not self.training_complete():
+                return False
+            if self.state.validation_rounds <= 0:
+                return True
+            return self.validation_complete()
+        return self.training_complete()
+
+    def start_validation(self, rounds: Optional[int] = None) -> None:
+        if self.state.mode is not SessionMode.USER or self.gp is None:
+            return
+        if rounds is not None:
+            self.state.validation_rounds = max(1, int(rounds))
+        if self.state.validation_rounds <= 0:
+            return
+        self.state.phase = SessionPhase.VALIDATION
+        self.state.validation_index = 0
+        self.validation_records.clear()
+
+        if self.rec_best.parameters is None or self.rec_best.mean_value is None:
+            self.rec_best = self._compute_recommendation()
+        self.validation_recommended = np.asarray(self.rec_best.parameters, dtype=float)
+
+        bounds = self._physical_bounds()
+        top_params, _ = top_k_by_mean(self.gp, bounds, n_samples=5000, k=2)
+        competitor = top_params[0]
+        if len(top_params) > 1:
+            competitor = top_params[1]
+        if np.allclose(competitor, self.validation_recommended):
+            alt_params, _ = top_k_by_mean(self.gp, bounds, n_samples=1000, k=3)
+            for cand in alt_params:
+                if not np.allclose(cand, self.validation_recommended):
+                    competitor = cand
+                    break
+        self.validation_competitor = np.asarray(competitor, dtype=float)
+
     # ------------------------------------------------------------------ #
     # User mode helpers
     # ------------------------------------------------------------------ #
     def generate_user_query(self) -> Optional[AudioCandidate]:
-        if not self.state.running or self.state.mode is not SessionMode.USER or self.gp is None:
+        if (
+            not self.state.running
+            or self.state.mode is not SessionMode.USER
+            or self.state.phase is not SessionPhase.TRAINING
+            or self.gp is None
+        ):
             return None
 
         query, info_gain = self.gp.find_optimal_query()
@@ -216,8 +319,46 @@ class PreferenceSession:
             audio_data=audio_data,
         )
         self.current_candidates = candidate
-        self.info_gain_history.append(float(info_gain))
         self.query_distance_history.append(dist)
+        return candidate
+
+    def generate_validation_query(self) -> Optional[AudioCandidate]:
+        if (
+            not self.state.running
+            or self.state.mode is not SessionMode.USER
+            or self.state.phase is not SessionPhase.VALIDATION
+            or self.gp is None
+        ):
+            return None
+        if self.validation_recommended is None or self.validation_competitor is None:
+            return None
+
+        p1_phys = np.asarray(self.validation_recommended, dtype=float)
+        p2_phys = np.asarray(self.validation_competitor, dtype=float)
+        p1_norm = self.gp.normalize_parameters(p1_phys)
+        p2_norm = self.gp.normalize_parameters(p2_phys)
+        dist = float(np.linalg.norm(p1_norm - p2_norm))
+
+        audio_data = {}
+        for idx, params in enumerate([p1_phys, p2_phys], start=1):
+            t, x, meta = self.audio.generate_signal(*params)
+            plot_waveform = meta.get("for_plot", {})
+            if isinstance(plot_waveform, dict) and "plot_waveform" in plot_waveform:
+                plot_vals = np.asarray(plot_waveform["plot_waveform"])
+            else:
+                plot_vals = x
+            if plot_vals.ndim == 2:
+                plot_vals = np.mean(plot_vals, axis=1)
+            audio_data[idx] = {"t": t, "x": x, "meta": meta, "plot": plot_vals}
+
+        candidate = AudioCandidate(
+            normalized=(p1_norm, p2_norm),
+            physical=(p1_phys, p2_phys),
+            info_gain=float("nan"),
+            query_distance=dist,
+            audio_data=audio_data,
+        )
+        self.current_candidates = candidate
         return candidate
 
     def record_user_choice(self, choice_label: str, level: int) -> None:
@@ -243,11 +384,21 @@ class PreferenceSession:
         counts = np.bincount(np.array(self.uncertainty_history, dtype=int), minlength=6)[1:6]
         self.level_count_history.append(counts.tolist())
 
-        self.info_gain_history.append(self.current_candidates.info_gain)
+        self.info_gain_history.append(float(self.current_candidates.info_gain))
         self.query_distance_history.append(self.current_candidates.query_distance)
 
         self.state.current_iteration += 1
         self._update_recommendation()
+
+    def record_validation_choice(self, choice_label: str, level: int) -> None:
+        if self.state.phase is not SessionPhase.VALIDATION:
+            return
+        level = int(np.clip(level, 1, 5))
+        record = ValidationRecord(
+            round_index=self.state.validation_index + 1, choice=choice_label, level=level
+        )
+        self.validation_records.append(record)
+        self.state.validation_index += 1
 
     # ------------------------------------------------------------------ #
     # Test mode helpers
@@ -278,7 +429,7 @@ class PreferenceSession:
                 gt2 = self._gt_value(p2_phys)
 
                 if self.eval_gt is None:
-                    self._build_eval_set(n=800, seed=123)
+                    self._build_eval_set(n=800)
                 gt_min = float(np.min(self.eval_gt))
                 gt_max = float(np.max(self.eval_gt))
                 gt_range = max(gt_max - gt_min, 1e-12)
@@ -326,71 +477,147 @@ class PreferenceSession:
     # ------------------------------------------------------------------ #
     # Metrics and evaluation
     # ------------------------------------------------------------------ #
-    def _update_recommendation(self) -> None:
-        if not self.parameter_history_phys:
-            return
-        selected = np.array(self.parameter_history_phys[-1], dtype=float)
-        self.rec_best = Recommendation(parameters=selected, mean_value=None)
-        self.rec_history_phys.append(selected.copy())
+    def _compute_recommendation(self) -> Recommendation:
+        if self.gp is None:
+            return Recommendation()
+        params, mean_val, method = self.gp.find_recommendation()
+        return Recommendation(parameters=np.asarray(params, dtype=float), mean_value=float(mean_val), method=method)
 
-    def _build_eval_set(self, n: int = 800, seed: int = 123) -> None:
-        rng = np.random.RandomState(seed)
+    def _update_recommendation(self) -> None:
+        if self.gp is None:
+            return
+        self.rec_best = self._compute_recommendation()
+        if self.rec_best.parameters is None or self.rec_best.mean_value is None:
+            return
+        self.rec_history_phys.append(self.rec_best.parameters.copy())
+        self.posterior_best_mean_history.append(float(self.rec_best.mean_value))
+
+    def _build_eval_set(self, n: int = 800) -> None:
         self.eval_pts_phys = []
         for _ in range(n):
-            a = rng.uniform(*self.audio.param_ranges["amplitude"])
-            f = rng.uniform(*self.audio.param_ranges["frequency"])
-            d = rng.uniform(*self.audio.param_ranges["density"])
-            g = rng.uniform(*self.audio.param_ranges["gradient"])
+            a = np.random.uniform(*self.audio.param_ranges["amplitude"])
+            f = np.random.uniform(*self.audio.param_ranges["frequency"])
+            d = np.random.uniform(*self.audio.param_ranges["density"])
+            g = np.random.uniform(*self.audio.param_ranges["gradient"])
             self.eval_pts_phys.append(np.array([a, f, d, g]))
         self.eval_gt = np.array([self._gt_value(p) for p in self.eval_pts_phys])
 
     def _update_test_metrics(self, update_rec_best: bool = False) -> None:
         if self.eval_pts_phys is None or self.eval_gt is None or self.gp is None:
             return
-        preds = []
-        for phys in self.eval_pts_phys:
-            norm = self.gp.normalize_parameters(phys)
-            mu = self.gp.mean1pt(norm)
-            preds.append(float(mu[0] if isinstance(mu, (list, tuple, np.ndarray)) else mu))
-        preds = np.asarray(preds)
-        gt = self.eval_gt
+        preds = posterior_mean(self.gp, self.eval_pts_phys)
+        gt = np.asarray(self.eval_gt, dtype=float)
 
-        if np.std(preds) < 1e-12 or np.std(gt) < 1e-12:
-            pear = 0.0
-            spear = 0.0
-        else:
-            pear = float(np.corrcoef(preds, gt)[0, 1])
-            sr = spearmanr(preds, gt)
-            spear = float(0.0 if sr.correlation is None or np.isnan(sr.correlation) else sr.correlation)
-        self.pearson_history.append(pear)
-        self.spearman_history.append(spear)
-
-        rng = np.random.RandomState(42)
-        N = len(gt)
-        idx_i = rng.randint(0, N, size=3500)
-        idx_j = rng.randint(0, N, size=3500)
-        mask = idx_i != idx_j
-        idx_i = idx_i[mask]
-        idx_j = idx_j[mask]
-        gt_diff = gt[idx_i] - gt[idx_j]
-        pr_diff = preds[idx_i] - preds[idx_j]
-        keep = np.abs(gt_diff) > 1e-12
-        acc = float(((gt_diff[keep] > 0) == (pr_diff[keep] > 0)).mean()) if keep.sum() > 0 else 0.5
-        self.pairacc_history.append(acc)
+        corr = correlation_metrics(preds, gt)
+        self.pearson_history.append(corr["pearson"])
+        self.spearman_history.append(corr["spearman"])
+        self.pairacc_history.append(pairwise_accuracy(preds, gt))
 
         if update_rec_best:
-            k = int(np.argmax(preds))
-            self.rec_best.parameters = np.asarray(self.eval_pts_phys[k], dtype=float)
-            self.rec_best.mean_value = float(preds[k])
+            self.rec_best = self._compute_recommendation()
+            if self.rec_best.parameters is None or self.rec_best.mean_value is None:
+                return
+            self.rec_history_phys.append(self.rec_best.parameters.copy())
+            self.posterior_best_mean_history.append(float(self.rec_best.mean_value))
             dist = float(np.linalg.norm(self.rec_best.parameters - self.ideal_phys))
             self.rec_distance_history.append(dist)
-            self.rec_history_phys.append(self.rec_best.parameters.copy())
             gt_min = float(np.min(gt))
             gt_max = float(np.max(gt))
             gt_range = max(gt_max - gt_min, 1e-12)
-            rec_gt_norm = float(np.clip((gt[k] - gt_min) / gt_range, 0.0, 1.0))
+            rec_gt = self._gt_value(self.rec_best.parameters)
+            rec_gt_norm = float(np.clip((rec_gt - gt_min) / gt_range, 0.0, 1.0))
             prev = self.best_so_far_history[-1] if self.best_so_far_history else 0.0
             self.best_so_far_history.append(max(prev, rec_gt_norm))
+
+    def _physical_bounds(self) -> List[Tuple[float, float]]:
+        ranges = self.audio.param_ranges
+        return [
+            ranges["amplitude"],
+            ranges["frequency"],
+            ranges["density"],
+            ranges["gradient"],
+        ]
+
+    def _bounds_dict(self) -> Dict[str, List[float]]:
+        ranges = self.audio.param_ranges
+        return {
+            key: [float(bounds[0]), float(bounds[1])]
+            for key, bounds in ranges.items()
+        }
+
+    def build_snapshot(self, status: str = "complete") -> Dict[str, object]:
+        recommended = self.rec_best
+        if (recommended.parameters is None or recommended.mean_value is None) and self.gp is not None:
+            recommended = self._compute_recommendation()
+
+        rec_params = (
+            list(map(float, np.asarray(recommended.parameters, dtype=float).tolist()))
+            if recommended.parameters is not None
+            else None
+        )
+        rec_score = float(recommended.mean_value) if recommended.mean_value is not None else None
+
+        bounds_list = self._physical_bounds()
+        bounds_dict = self._bounds_dict()
+        if self.gp is not None:
+            uncertainty = posterior_uncertainty(self.gp, bounds_list, n_samples=500)
+        else:
+            uncertainty = {"avg_pred_var": None, "max_pred_var": None}
+
+        final_summary: Dict[str, object] = {
+            "recommended_params": rec_params,
+            "recommended_score": rec_score,
+            "method": recommended.method,
+            "bounds": bounds_dict,
+            "posterior_uncertainty": uncertainty,
+        }
+
+        if self.state.mode is SessionMode.USER:
+            final_summary["validation"] = validation_summary(
+                self.validation_records, self.validation_recommended, self.validation_competitor
+            )
+
+        if (
+            self.state.mode is SessionMode.TEST
+            and self.gp is not None
+            and self.eval_pts_phys is not None
+            and self.eval_gt is not None
+            and recommended.parameters is not None
+        ):
+            final_summary["test_metrics"] = test_metrics(
+                self.gp, self.eval_pts_phys, self.eval_gt, recommended.parameters, gt_eval_fn=self._gt_value
+            )
+
+        metrics = {
+            "info_gain": list(map(float, self.info_gain_history)),
+            "posterior_best_mean": list(map(float, self.posterior_best_mean_history)),
+        }
+
+        metadata = {
+            "mode": self.state.mode.value,
+            "n_queries_planned": int(self.state.max_iterations),
+            "n_queries_completed": int(self.state.current_iteration),
+            "status": status,
+        }
+
+        snapshot: Dict[str, object] = {
+            "mode": self.state.mode.value,
+            "max_iterations": self.state.max_iterations,
+            "completed_iterations": self.state.current_iteration,
+            "preferences": self.preference_history,
+            "uncertainties": self.uncertainty_history,
+            "info_gain": self.info_gain_history,
+            "query_distance": self.query_distance_history,
+            "parameters": [list(map(float, np.asarray(p).tolist())) for p in self.parameter_history_phys],
+            "recommendation_history": [
+                list(map(float, np.asarray(p).tolist())) for p in self.rec_history_phys
+            ],
+            "final_recommendation": rec_params,
+            "final_summary": final_summary,
+            "metrics": metrics,
+            "metadata": metadata,
+        }
+        return snapshot
 
     # ------------------------------------------------------------------ #
     # Ground truth utilities

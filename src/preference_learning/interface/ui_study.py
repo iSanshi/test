@@ -33,7 +33,7 @@ matplotlib.rcParams.update({
     "axes.unicode_minus": False
 })
 
-from .session import PreferenceSession, SessionMode, GroundTruthKind
+from .session import PreferenceSession, SessionMode, SessionPhase, GroundTruthKind
 from ..audio.generator import (
     DEFAULT_OUTPUT_DEVICE,
     OUTPUT_DEVICE_LABELS,
@@ -384,6 +384,7 @@ class AudioPreferenceStudyApp:
         self._last_drawn_test_iteration: int = -1
         self._last_logged_test_record: int = 0
         self._exported_data: bool = False
+        self.validation_rounds: int = 3
 
         # UI Layout
         self._setup_layout()
@@ -608,11 +609,26 @@ class AudioPreferenceStudyApp:
         ax.grid(True, alpha=0.3)
         self.canvas_wave.draw()
 
+    def _update_iteration_label(self):
+        if self.session.state.phase is SessionPhase.VALIDATION:
+            idx = self.session.state.validation_index + 1
+            total = max(1, self.session.state.validation_rounds)
+            self.iter_label.config(text=f"Validation Round {idx} / {total}")
+        else:
+            self.iter_label.config(
+                text=f"Iteration: {self.session.state.current_iteration} / {self.session.state.max_iterations}"
+            )
+
     # --- Session Logic ---
     def _start_session(self):
         try:
             mode = SessionMode.USER if self.mode_var.get() == SessionMode.USER.value else SessionMode.TEST
-            self.session.start(mode, 35, GroundTruthKind.GAUSSIAN_CENTER.value)
+            self.session.start(
+                mode,
+                35,
+                GroundTruthKind.GAUSSIAN_CENTER.value,
+                validation_rounds=self.validation_rounds,
+            )
             self._exported_data = False
             self._last_drawn_test_iteration = -1
             self._last_logged_test_record = 0
@@ -661,7 +677,10 @@ class AudioPreferenceStudyApp:
 
     def _prepare_new_candidate(self):
         try:
-            self.current_candidate = self.session.generate_user_query()
+            if self.session.state.phase is SessionPhase.VALIDATION:
+                self.current_candidate = self.session.generate_validation_query()
+            else:
+                self.current_candidate = self.session.generate_user_query()
             if not self.current_candidate:
                 self._finish_session()
                 return
@@ -674,7 +693,7 @@ class AudioPreferenceStudyApp:
             self.btn_submit.set_state("disabled")
             self.btn_play_a.set_state("normal")
             self.btn_play_b.set_state("normal")
-            self.iter_label.config(text=f"Iteration: {self.session.state.current_iteration} / {self.session.state.max_iterations}")
+            self._update_iteration_label()
         except Exception as e:
             self._log_raw("Error", f"Generating query: {e}")
 
@@ -719,13 +738,35 @@ class AudioPreferenceStudyApp:
         if not self.selected_choice: return
         try:
             level = self.level_var.get()
+            if self.session.state.phase is SessionPhase.VALIDATION:
+                round_idx = self.session.state.validation_index + 1
+                self.session.record_validation_choice(self.selected_choice, level)
+                self._log_pair("Validation", level, self.selected_choice, iter_label=f"Val {round_idx:02d}")
+
+                if self.session.validation_complete():
+                    self._finish_session()
+                else:
+                    self._prepare_new_candidate()
+                    self.focus_manager.current_row = 2
+                    self.focus_manager.current_col = 0
+                    self.focus_manager._update_focus()
+                return
+
             self.session.record_user_choice(self.selected_choice, level)
-            
+
             # DETAILED LOGGING (Restored)
             self._log_pair("User", level, self.selected_choice)
 
-            if self.session.state.current_iteration >= self.session.state.max_iterations:
-                self._finish_session()
+            if self.session.training_complete():
+                if self.session.state.validation_rounds > 0:
+                    self.session.start_validation()
+                    self._log_raw(
+                        "System",
+                        f"Validation rounds started ({self.session.state.validation_rounds}).",
+                    )
+                    self._prepare_new_candidate()
+                else:
+                    self._finish_session()
             else:
                 self._prepare_new_candidate()
                 # Reset focus to Play A
@@ -737,8 +778,14 @@ class AudioPreferenceStudyApp:
 
     def _finish_session(self):
         self._log_raw("System", "Session Complete!")
-        messagebox.showinfo("Done", "User Study Complete. Thank you!")
-        self._persist_study_data()
+        self._show_recommendation_dialog(
+            title="User Study Complete",
+            header="User Study Complete. Thank you!",
+            on_close=self._finalize_user_session,
+        )
+
+    def _finalize_user_session(self):
+        self._persist_study_data(status="complete")
         self._reset()
 
     # --- Logging Helpers (Restored) ---
@@ -774,7 +821,7 @@ class AudioPreferenceStudyApp:
         except Exception:
             return "[I=?, T=?, R=?, G=?]"
 
-    def _log_pair(self, mode_tag: str, level: int, choice: str) -> None:
+    def _log_pair(self, mode_tag: str, level: int, choice: str, iter_label: Optional[str] = None) -> None:
         if not self.current_candidate: return
         p1_phys, p2_phys = self.current_candidate.physical
         meta1 = self.current_audio_data.get(1, {}).get("meta", {})
@@ -784,37 +831,21 @@ class AudioPreferenceStudyApp:
             extra.append(f"EIG={self.current_candidate.info_gain:.3f}")
         extra.append(f"Dist={self.current_candidate.query_distance:.3f}")
         extra_str = (" | " + ", ".join(extra)) if extra else ""
-        
+
+        iter_tag = iter_label if iter_label is not None else f"Iter {self.session.state.current_iteration:02d}"
         line = (
-            f"Iter {self.session.state.current_iteration:02d} | "
+            f"{iter_tag} | "
             f"A {self._fmt_rumble(meta1)} vs B {self._fmt_rumble(meta2)} | "
             f"pick={choice} | level={level}{extra_str}"
         )
         self._log_raw(mode_tag, line)
 
-    def _persist_study_data(self):
+    def _persist_study_data(self, status: str = "complete"):
         if self._exported_data:
             return
         try:
-            snapshot = {
-                "mode": self.session.state.mode.value,
-                "max_iterations": self.session.state.max_iterations,
-                "completed_iterations": self.session.state.current_iteration,
-                "preferences": self.session.preference_history,
-                "uncertainties": self.session.uncertainty_history,
-                "info_gain": self.session.info_gain_history,
-                "query_distance": self.session.query_distance_history,
-                "parameters": [list(map(float, np.asarray(p).tolist())) for p in self.session.parameter_history_phys],
-                "recommendation_history": [
-                    list(map(float, np.asarray(p).tolist())) for p in self.session.rec_history_phys
-                ],
-                "final_recommendation": (
-                    list(map(float, np.asarray(self.session.rec_best.parameters).tolist()))
-                    if self.session.rec_best.parameters is not None
-                    else None
-                ),
-                "timestamp": datetime.now().isoformat(),
-            }
+            snapshot = self.session.build_snapshot(status=status)
+            snapshot["timestamp"] = datetime.now().isoformat()
 
             base_dir = Path.cwd() / "data"
             base_dir.mkdir(exist_ok=True)
@@ -833,6 +864,111 @@ class AudioPreferenceStudyApp:
             self._exported_data = True
         except Exception as exc:
             self._log_raw("Error", f"Export failed: {exc}")
+
+    def _play_recommended(self):
+        if self.session.rec_best.parameters is None:
+            return
+        try:
+            params = np.asarray(self.session.rec_best.parameters, dtype=float)
+            self.session.audio.stop_audio()
+            _, data, meta = self.session.audio.generate_signal(*params)
+            self.session.audio.play_audio(data, metadata=meta, blocking=False)
+        except Exception as exc:
+            self._log_raw("Error", f"Play recommended failed: {exc}")
+
+    def _show_recommendation_dialog(
+        self,
+        title: str,
+        header: str,
+        detail: Optional[str] = None,
+        on_close: Optional[Callable[[], None]] = None,
+    ) -> None:
+        params = None
+        if self.session.rec_best.parameters is not None:
+            params = np.asarray(self.session.rec_best.parameters, dtype=float)
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.configure(bg=COLOR_PANEL)
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = tk.Frame(dialog, bg=COLOR_PANEL, padx=24, pady=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(
+            frame,
+            text=header,
+            bg=COLOR_PANEL,
+            fg=COLOR_TEXT,
+            font=("Helvetica", 14, "bold"),
+        ).pack(pady=(0, 8))
+
+        if detail:
+            tk.Label(
+                frame,
+                text=detail,
+                bg=COLOR_PANEL,
+                fg=COLOR_MUTED,
+                font=("Helvetica", 11),
+            ).pack(pady=(0, 10))
+
+        if params is not None:
+            tk.Label(
+                frame,
+                text=f"Recommended: {self._fmt_phys(params)}",
+                bg=COLOR_PANEL,
+                fg=COLOR_ACCENT,
+                font=("Helvetica", 12, "bold"),
+            ).pack(pady=(0, 18))
+        else:
+            tk.Label(
+                frame,
+                text="No recommendation available.",
+                bg=COLOR_PANEL,
+                fg=COLOR_MUTED,
+                font=("Helvetica", 12),
+            ).pack(pady=(0, 18))
+
+        btn_row = tk.Frame(frame, bg=COLOR_PANEL)
+        btn_row.pack()
+
+        play_btn = tk.Button(
+            btn_row,
+            text="Play Recommended",
+            command=self._play_recommended,
+            bg=COLOR_ACCENT,
+            fg="#ffffff",
+            relief="flat",
+            padx=14,
+            pady=6,
+        )
+        if params is None:
+            play_btn.configure(state="disabled")
+        play_btn.pack(side=tk.LEFT, padx=6)
+
+        def handle_close():
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            dialog.destroy()
+            if on_close:
+                on_close()
+
+        close_btn = tk.Button(
+            btn_row,
+            text="Close",
+            command=handle_close,
+            bg=COLOR_PANEL,
+            fg=COLOR_TEXT,
+            relief="groove",
+            padx=14,
+            pady=6,
+        )
+        close_btn.pack(side=tk.LEFT, padx=6)
+        dialog.protocol("WM_DELETE_WINDOW", handle_close)
 
     # --- Auto-test polling (TEST mode) ---
     def _schedule_test_poll(self) -> None:
@@ -904,19 +1040,16 @@ class AudioPreferenceStudyApp:
                     f"Recommendation: [{params[0]:.2f}, {params[1]:.2f}, {params[2]:.2f}, {params[3]:.2f}] | "
                     f"DistToGT={dist:.3f}",
                 )
-                messagebox.showinfo(
-                    "Recommendation",
-                    (
-                        "Automatic test complete.\n"
-                        f"Recommended parameters:\n"
-                        f"[{params[0]:.2f}, {params[1]:.2f}, {params[2]:.2f}, {params[3]:.2f}]\n"
-                        f"Distance to GT: {dist:.3f}"
-                    ),
+                self._show_recommendation_dialog(
+                    title="Automatic Test Complete",
+                    header="Automatic test complete.",
+                    detail=f"Distance to GT: {dist:.3f}",
+                    on_close=lambda: self._persist_study_data(status="complete"),
                 )
             else:
                 messagebox.showinfo("Test complete", f"Ran {iteration} iterations.")
+                self._persist_study_data(status="complete")
 
-            self._persist_study_data()
             return
 
         self._test_poll_job = self.root.after(250, self._poll_test_session)
@@ -1132,6 +1265,9 @@ class AudioPreferenceStudyApp:
             self.session.stop()
         except Exception:
             pass
+        if not self._exported_data:
+            status = "complete" if self.session.is_complete() else "incomplete"
+            self._persist_study_data(status=status)
         try: self.session.audio.stop_audio()
         except: pass
         if self.gp_process.is_alive():
