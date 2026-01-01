@@ -1,0 +1,61 @@
+{
+  "mode": "User Study",
+  "max_iterations": 35,
+  "completed_iterations": 0,
+  "preferences": [],
+  "uncertainties": [],
+  "info_gain": [],
+  "query_distance": [],
+  "parameters": [],
+  "recommendation_history": [],
+  "final_recommendation": null,
+  "final_summary": {
+    "recommended_params": null,
+    "recommended_score": null,
+    "method": null,
+    "bounds": {
+      "intensity": [
+        20.0,
+        100.0
+      ],
+      "texture": [
+        20.0,
+        100.0
+      ],
+      "rhythm": [
+        20.0,
+        100.0
+      ],
+      "grain": [
+        20.0,
+        100.0
+      ]
+    },
+    "posterior_uncertainty": {
+      "avg_pred_var": null,
+      "max_pred_var": null
+    },
+    "validation": {
+      "rounds": 0,
+      "win_rate": 0.0,
+      "records": [],
+      "recommended_params": null,
+      "competitor_params": null
+    },
+    "validation_config": null
+  },
+  "metrics": {
+    "info_gain": [],
+    "posterior_rec_mean": [],
+    "posterior_best_mean": [],
+    "gt_regret_history": [],
+    "gt_spearman_history": []
+  },
+  "metadata": {
+    "mode": "User Study",
+    "n_queries_planned": 35,
+    "n_queries_completed": 0,
+    "status": "incomplete"
+  },
+  "timestamp": "2026-01-02T04:22:20.404921"
+}

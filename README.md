@@ -39,6 +39,7 @@ The export keeps legacy fields and adds structured summaries:
 - `final_summary`: GP posterior-mean recommendation, search method, bounds, posterior uncertainty, and (mode-dependent) validation/test metrics.
 - `metrics`: per-iteration arrays such as `info_gain` (aligned to preferences) and `posterior_best_mean`.
 - `metadata`: session mode, planned/completed queries, and completion status.
+- Additional test/validation fields: `gt_best_val`, `gt_best_params`, `gt_rec_val`, `eval_set_best_val`, `gt_search_config`, `validation_config`, `gt_regret_history`, `gt_spearman_history`.
 
 Example snippet:
 ```json

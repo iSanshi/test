@@ -4,9 +4,10 @@ Session/business logic for the audio preference learning application.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -16,9 +17,11 @@ from ..audio import AudioGenerator
 from ..gp import AudioPreferenceGaussianProcess
 from ..evaluation import (
     correlation_metrics,
+    find_strong_ground_truth,
     pairwise_accuracy,
     posterior_mean,
     posterior_uncertainty,
+    recursive_sanitize,
     test_metrics,
     top_k_by_mean,
     validation_summary,
@@ -29,6 +32,16 @@ LEVEL_TO_WEIGHT = {1: 0.1, 2: 0.3, 3: 0.5, 4: 0.8, 5: 1.0}
 DIFF_THRESHOLDS = [0.01, 0.05, 0.10, 0.20]
 DEFAULT_SESSION_SEED = 123
 DEFAULT_VALIDATION_ROUNDS = 3
+DEFAULT_GT_RANDOM_SAMPLES = 10000
+DEFAULT_GT_TOP_K = 20
+DEFAULT_VALIDATION_TOP_K = 20
+DEFAULT_VALIDATION_RANDOM_TRIALS = 200
+PARAMETER_NAME_MAP = {
+    "intensity": "amplitude",
+    "texture": "frequency",
+    "rhythm": "density",
+    "grain": "gradient",
+}
 
 
 def level_from_diff_legacy(diff_abs_norm: float) -> int:
@@ -144,10 +157,19 @@ class PreferenceSession:
         self.rec_distance_history: List[float] = []
         self.rec_history_phys: List[np.ndarray] = []
         self.posterior_best_mean_history: List[float] = []
+        self.posterior_rec_mean_history: List[float] = []
+        self.gt_regret_history: List[float] = []
+        self.gt_spearman_history: List[float] = []
         self.test_query_history: List[TestQueryRecord] = []
         self.validation_records: List[ValidationRecord] = []
         self.validation_recommended: Optional[np.ndarray] = None
         self.validation_competitor: Optional[np.ndarray] = None
+        self.validation_config: Optional[Dict[str, object]] = None
+
+        self.gt_best_val: Optional[float] = None
+        self.gt_best_params: Optional[np.ndarray] = None
+        self.eval_set_best_val: Optional[float] = None
+        self.gt_search_config: Optional[Dict[str, object]] = None
 
         # Test evaluation
         self.eval_pts_phys: Optional[List[np.ndarray]] = None
@@ -183,10 +205,18 @@ class PreferenceSession:
         self.rec_distance_history.clear()
         self.rec_history_phys.clear()
         self.posterior_best_mean_history.clear()
+        self.posterior_rec_mean_history.clear()
+        self.gt_regret_history.clear()
+        self.gt_spearman_history.clear()
         self.test_query_history.clear()
         self.validation_records.clear()
         self.validation_recommended = None
         self.validation_competitor = None
+        self.validation_config = None
+        self.gt_best_val = None
+        self.gt_best_params = None
+        self.eval_set_best_val = None
+        self.gt_search_config = None
         self.eval_pts_phys = None
         self.eval_gt = None
 
@@ -231,6 +261,22 @@ class PreferenceSession:
 
         if self.state.mode is SessionMode.TEST:
             self._build_eval_set(n=800)
+            if self.eval_gt is not None and len(self.eval_gt) > 0:
+                self.eval_set_best_val = float(np.max(self.eval_gt))
+            bounds = self._physical_bounds()
+            gt_best_val, gt_best_params = find_strong_ground_truth(
+                self._gt_value,
+                bounds,
+                n_random=DEFAULT_GT_RANDOM_SAMPLES,
+                top_k=DEFAULT_GT_TOP_K,
+            )
+            self.gt_best_val = float(gt_best_val)
+            self.gt_best_params = np.asarray(gt_best_params, dtype=float)
+            self.gt_search_config = {
+                "n_random": int(DEFAULT_GT_RANDOM_SAMPLES),
+                "top_k": int(DEFAULT_GT_TOP_K),
+                "method": "lbfgsb",
+            }
 
     def stop(self) -> None:
         self.state.running = False
@@ -267,17 +313,55 @@ class PreferenceSession:
         self.validation_recommended = np.asarray(self.rec_best.parameters, dtype=float)
 
         bounds = self._physical_bounds()
-        top_params, _ = top_k_by_mean(self.gp, bounds, n_samples=5000, k=2)
-        competitor = top_params[0]
-        if len(top_params) > 1:
-            competitor = top_params[1]
-        if np.allclose(competitor, self.validation_recommended):
-            alt_params, _ = top_k_by_mean(self.gp, bounds, n_samples=1000, k=3)
-            for cand in alt_params:
-                if not np.allclose(cand, self.validation_recommended):
-                    competitor = cand
-                    break
+        bounds_arr = np.asarray(bounds, dtype=float)
+        diag = float(np.linalg.norm(bounds_arr[:, 1] - bounds_arr[:, 0]))
+        threshold = 0.05 * diag
+
+        top_params, _ = top_k_by_mean(
+            self.gp, bounds, n_samples=5000, k=DEFAULT_VALIDATION_TOP_K
+        )
+        competitor = None
+        strategy = "top_k"
+        for cand in top_params:
+            if float(np.linalg.norm(cand - self.validation_recommended)) >= threshold:
+                competitor = cand
+                break
+
+        baseline = self.gp.denormalize_parameters(self.gp.initialPoint)
+        baseline_dist = float(np.linalg.norm(baseline - self.validation_recommended))
+        random_trials = 0
+
+        if competitor is None:
+            if baseline_dist >= threshold:
+                competitor = baseline
+                strategy = "baseline"
+            else:
+                strategy = "random_far"
+                lows = bounds_arr[:, 0]
+                highs = bounds_arr[:, 1]
+                best = baseline
+                best_dist = baseline_dist
+                random_trials = DEFAULT_VALIDATION_RANDOM_TRIALS
+                for _ in range(DEFAULT_VALIDATION_RANDOM_TRIALS):
+                    cand = np.random.uniform(lows, highs, size=baseline.shape)
+                    dist = float(np.linalg.norm(cand - self.validation_recommended))
+                    if dist >= threshold:
+                        competitor = cand
+                        break
+                    if dist > best_dist:
+                        best_dist = dist
+                        best = cand
+                if competitor is None:
+                    competitor = best
+
         self.validation_competitor = np.asarray(competitor, dtype=float)
+        self.validation_config = {
+            "threshold": float(threshold),
+            "strategy": strategy,
+            "top_k": int(DEFAULT_VALIDATION_TOP_K),
+            "random_trials": int(random_trials),
+            "diag": float(diag),
+        }
 
     # ------------------------------------------------------------------ #
     # User mode helpers
@@ -483,6 +567,13 @@ class PreferenceSession:
         params, mean_val, method = self.gp.find_recommendation()
         return Recommendation(parameters=np.asarray(params, dtype=float), mean_value=float(mean_val), method=method)
 
+    def _append_posterior_best_mean(self, current_mean: float) -> None:
+        if self.posterior_best_mean_history:
+            prev = self.posterior_best_mean_history[-1]
+            self.posterior_best_mean_history.append(max(prev, current_mean))
+        else:
+            self.posterior_best_mean_history.append(current_mean)
+
     def _update_recommendation(self) -> None:
         if self.gp is None:
             return
@@ -490,7 +581,8 @@ class PreferenceSession:
         if self.rec_best.parameters is None or self.rec_best.mean_value is None:
             return
         self.rec_history_phys.append(self.rec_best.parameters.copy())
-        self.posterior_best_mean_history.append(float(self.rec_best.mean_value))
+        self.posterior_rec_mean_history.append(float(self.rec_best.mean_value))
+        self._append_posterior_best_mean(float(self.rec_best.mean_value))
 
     def _build_eval_set(self, n: int = 800) -> None:
         self.eval_pts_phys = []
@@ -511,6 +603,7 @@ class PreferenceSession:
         corr = correlation_metrics(preds, gt)
         self.pearson_history.append(corr["pearson"])
         self.spearman_history.append(corr["spearman"])
+        self.gt_spearman_history.append(corr["spearman"])
         self.pairacc_history.append(pairwise_accuracy(preds, gt))
 
         if update_rec_best:
@@ -518,7 +611,8 @@ class PreferenceSession:
             if self.rec_best.parameters is None or self.rec_best.mean_value is None:
                 return
             self.rec_history_phys.append(self.rec_best.parameters.copy())
-            self.posterior_best_mean_history.append(float(self.rec_best.mean_value))
+            self.posterior_rec_mean_history.append(float(self.rec_best.mean_value))
+            self._append_posterior_best_mean(float(self.rec_best.mean_value))
             dist = float(np.linalg.norm(self.rec_best.parameters - self.ideal_phys))
             self.rec_distance_history.append(dist)
             gt_min = float(np.min(gt))
@@ -528,6 +622,14 @@ class PreferenceSession:
             rec_gt_norm = float(np.clip((rec_gt - gt_min) / gt_range, 0.0, 1.0))
             prev = self.best_so_far_history[-1] if self.best_so_far_history else 0.0
             self.best_so_far_history.append(max(prev, rec_gt_norm))
+
+            gt_best_val = self.gt_best_val if self.gt_best_val is not None else self.eval_set_best_val
+            if gt_best_val is None:
+                regret = 0.0
+            else:
+                gt_rec_val = float(self._gt_value(self.rec_best.parameters))
+                regret = float(max(0.0, (gt_best_val - gt_rec_val) / (abs(gt_best_val) + 1e-12)))
+            self.gt_regret_history.append(regret)
 
     def _physical_bounds(self) -> List[Tuple[float, float]]:
         ranges = self.audio.param_ranges
@@ -540,10 +642,13 @@ class PreferenceSession:
 
     def _bounds_dict(self) -> Dict[str, List[float]]:
         ranges = self.audio.param_ranges
-        return {
-            key: [float(bounds[0]), float(bounds[1])]
-            for key, bounds in ranges.items()
-        }
+        bounds_dict = {}
+        for canonical, legacy in PARAMETER_NAME_MAP.items():
+            bounds = ranges.get(legacy)
+            if bounds is None:
+                continue
+            bounds_dict[canonical] = [float(bounds[0]), float(bounds[1])]
+        return bounds_dict
 
     def build_snapshot(self, status: str = "complete") -> Dict[str, object]:
         recommended = self.rec_best
@@ -576,6 +681,7 @@ class PreferenceSession:
             final_summary["validation"] = validation_summary(
                 self.validation_records, self.validation_recommended, self.validation_competitor
             )
+            final_summary["validation_config"] = self.validation_config
 
         if (
             self.state.mode is SessionMode.TEST
@@ -584,13 +690,39 @@ class PreferenceSession:
             and self.eval_gt is not None
             and recommended.parameters is not None
         ):
+            gt_rec_val = float(self._gt_value(recommended.parameters))
+            gt_best_params = (
+                np.asarray(self.gt_best_params, dtype=float) if self.gt_best_params is not None else None
+            )
+            gt_best_val = float(self.gt_best_val) if self.gt_best_val is not None else None
+            eval_set_best_val = float(self.eval_set_best_val) if self.eval_set_best_val is not None else None
+            final_summary.update(
+                {
+                    "gt_best_val": gt_best_val,
+                    "gt_best_params": (
+                        list(map(float, gt_best_params.tolist())) if gt_best_params is not None else None
+                    ),
+                    "gt_rec_val": gt_rec_val,
+                    "eval_set_best_val": eval_set_best_val,
+                    "gt_search_config": self.gt_search_config,
+                }
+            )
+            true_optimum_params = gt_best_params if gt_best_params is not None else self.ideal_phys
             final_summary["test_metrics"] = test_metrics(
-                self.gp, self.eval_pts_phys, self.eval_gt, recommended.parameters, gt_eval_fn=self._gt_value
+                self.gp,
+                self.eval_pts_phys,
+                self.eval_gt,
+                recommended.parameters,
+                true_optimum_params=true_optimum_params,
+                gt_eval_fn=self._gt_value,
             )
 
         metrics = {
             "info_gain": list(map(float, self.info_gain_history)),
+            "posterior_rec_mean": list(map(float, self.posterior_rec_mean_history)),
             "posterior_best_mean": list(map(float, self.posterior_best_mean_history)),
+            "gt_regret_history": list(map(float, self.gt_regret_history)),
+            "gt_spearman_history": list(map(float, self.gt_spearman_history)),
         }
 
         metadata = {
@@ -617,6 +749,8 @@ class PreferenceSession:
             "metrics": metrics,
             "metadata": metadata,
         }
+        snapshot = recursive_sanitize(snapshot)
+        json.dumps(snapshot, allow_nan=False)
         return snapshot
 
     # ------------------------------------------------------------------ #

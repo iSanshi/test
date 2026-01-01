@@ -4,9 +4,11 @@ Evaluation utilities for preference learning sessions.
 
 from __future__ import annotations
 
+import math
 from typing import Callable, Dict, Optional, Sequence, Tuple, Union
 
 import numpy as np
+from scipy.optimize import minimize
 from scipy.stats import spearmanr
 
 
@@ -94,6 +96,55 @@ def top_k_by_mean(
     return samples[top_idx], mu_vals[top_idx]
 
 
+def find_strong_ground_truth(
+    gt_func: Callable[[Sequence[float]], float],
+    bounds: Sequence[Tuple[float, float]],
+    n_random: int = 10000,
+    top_k: int = 20,
+) -> Tuple[float, np.ndarray]:
+    bounds_arr = np.asarray(bounds, dtype=float)
+    if bounds_arr.ndim != 2 or bounds_arr.shape[1] != 2:
+        raise ValueError("bounds must be a sequence of (low, high) pairs.")
+    samples = sample_uniform(bounds, n_random)
+    gt_vals = []
+    for x in samples:
+        try:
+            val = float(gt_func(x))
+        except Exception:
+            val = float("-inf")
+        gt_vals.append(val)
+    gt_vals = np.asarray(gt_vals, dtype=float)
+    gt_vals = np.where(np.isfinite(gt_vals), gt_vals, -np.inf)
+
+    if gt_vals.size == 0:
+        raise ValueError("No samples available for ground-truth search.")
+
+    order = np.argsort(gt_vals)[::-1]
+    k = max(1, min(int(top_k), len(order)))
+    top_idx = order[:k]
+
+    best_val = float(gt_vals[top_idx[0]])
+    best_params = np.asarray(samples[top_idx[0]], dtype=float)
+
+    bounds_list = [(float(lo), float(hi)) for lo, hi in bounds_arr]
+
+    def negative_gt(x: np.ndarray) -> float:
+        return -float(gt_func(x))
+
+    for idx in top_idx:
+        x0 = np.asarray(samples[idx], dtype=float)
+        try:
+            res = minimize(negative_gt, x0=x0, bounds=bounds_list, method="L-BFGS-B")
+            val = -float(res.fun)
+            if np.isfinite(val) and val > best_val:
+                best_val = val
+                best_params = np.asarray(res.x, dtype=float)
+        except Exception:
+            continue
+
+    return float(best_val), np.asarray(best_params, dtype=float)
+
+
 def validation_summary(
     records,
     recommended_params: Optional[np.ndarray],
@@ -126,6 +177,7 @@ def test_metrics(
     eval_pts: Sequence[Sequence[float]],
     eval_gt: Sequence[float],
     recommended_params: Optional[np.ndarray],
+    true_optimum_params: Sequence[float],
     gt_eval_fn: Optional[Callable[[Sequence[float]], float]] = None,
 ) -> Dict[str, Optional[float]]:
     preds = posterior_mean(gp, eval_pts)
@@ -139,22 +191,17 @@ def test_metrics(
             "distance_to_optimum": None,
         }
 
-    best_idx = int(np.argmax(gt_arr))
-    gt_best = float(gt_arr[best_idx])
-    best_params = np.asarray(eval_pts, dtype=float)[best_idx]
-
-    rec_gt = None
-    if recommended_params is not None and gt_eval_fn is not None:
-        rec_gt = float(gt_eval_fn(recommended_params))
-
-    if rec_gt is None or gt_best <= 1e-12:
-        regret = None
-    else:
-        regret = float((gt_best - rec_gt) / gt_best)
+    regret = None
+    if gt_eval_fn is not None and recommended_params is not None and true_optimum_params is not None:
+        gt_best = float(gt_eval_fn(true_optimum_params))
+        gt_rec = float(gt_eval_fn(recommended_params))
+        regret = float(max(0.0, (gt_best - gt_rec) / (abs(gt_best) + 1e-12)))
 
     dist = None
-    if recommended_params is not None:
-        dist = float(np.linalg.norm(np.asarray(recommended_params, dtype=float) - best_params))
+    if recommended_params is not None and true_optimum_params is not None:
+        dist = float(
+            np.linalg.norm(np.asarray(recommended_params, dtype=float) - np.asarray(true_optimum_params, dtype=float))
+        )
 
     return {
         "pearson": corr["pearson"],
@@ -162,3 +209,20 @@ def test_metrics(
         "regret": regret,
         "distance_to_optimum": dist,
     }
+
+
+def recursive_sanitize(obj):
+    if isinstance(obj, dict):
+        return {k: recursive_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [recursive_sanitize(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return recursive_sanitize(obj.tolist())
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    if isinstance(obj, (np.floating, float)):
+        val = float(obj)
+        return val if math.isfinite(val) else None
+    if isinstance(obj, (np.integer, int)):
+        return int(obj)
+    return obj

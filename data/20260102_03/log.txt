@@ -1,0 +1,5 @@
+[01:56:31] [System] Gamepad Service Started (Multiprocess).
+[01:56:35] [System] Session Started.
+[01:56:35] [System] Rumble params: I/T/R/G in [20,100], duration=3.0s to Xbox controller.
+[01:57:08] [User] Iter 01 | A [I=0.20, T=L0%/R100%, R=0.30Hz, G=10% | s=20.0,20.0,20.0,20.0] vs B [I=1.00, T=L100%/R0%, R=4.00Hz, G=70% | s=100.0,100.0,100.0,100.0] | pick=A | level=3 | EIG=0.920, Dist=2.000
+[02:04:16] [User] Iter 02 | A [I=0.20, T=L100%/R0%, R=0.30Hz, G=70% | s=20.0,100.0,20.0,100.0] vs B [I=1.00, T=L0%/R100%, R=4.00Hz, G=10% | s=100.0,20.0,100.0,20.0] | pick=B | level=4 | EIG=0.919, Dist=2.000

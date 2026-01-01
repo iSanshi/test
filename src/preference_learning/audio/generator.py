@@ -72,7 +72,7 @@ def _map_balance_left(slider_val: float) -> float:
 
 
 def _map_rhythm_hz(slider_val: float) -> float:
-    return 0.30 + _norm_slider(slider_val) * 3.70
+    return 0.60 + _norm_slider(slider_val) * 3.40
 
 
 def _map_grain_duty(slider_val: float) -> float:

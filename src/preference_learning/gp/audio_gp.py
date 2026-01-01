@@ -14,6 +14,26 @@ from .gaussian_process import GaussianProcess
 
 
 ParameterBounds = Dict[str, Tuple[float, float]]
+CANONICAL_PARAM_ORDER = ("intensity", "texture", "rhythm", "grain")
+LEGACY_PARAM_ALIASES = {
+    "amplitude": "intensity",
+    "frequency": "texture",
+    "density": "rhythm",
+    "gradient": "grain",
+}
+CANONICAL_TO_LEGACY = {v: k for k, v in LEGACY_PARAM_ALIASES.items()}
+
+
+def _canonicalize_bounds(bounds: ParameterBounds) -> ParameterBounds:
+    canonical: ParameterBounds = {}
+    for name in CANONICAL_PARAM_ORDER:
+        if name in bounds:
+            canonical[name] = bounds[name]
+        else:
+            legacy = CANONICAL_TO_LEGACY.get(name)
+            if legacy in bounds:
+                canonical[name] = bounds[legacy]
+    return canonical if len(canonical) == len(CANONICAL_PARAM_ORDER) else bounds
 
 
 @dataclass
@@ -22,14 +42,15 @@ class AudioPreferenceGaussianProcess(GaussianProcess):
 
     parameter_bounds: ParameterBounds = field(
         default_factory=lambda: {
-            "amplitude": (20.0, 100.0),
-            "frequency": (20.0, 100.0),
-            "density": (20.0, 100.0),
-            "gradient": (20.0, 100.0),
+            "intensity": (20.0, 100.0),
+            "texture": (20.0, 100.0),
+            "rhythm": (20.0, 100.0),
+            "grain": (20.0, 100.0),
         }
     )
 
     def __post_init__(self) -> None:
+        self.parameter_bounds = _canonicalize_bounds(self.parameter_bounds)
         if self.initial_point is None:
             self.initial_point = [0.5, 0.5, 0.5, 0.5]
         super().__post_init__()

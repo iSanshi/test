@@ -1,0 +1,72 @@
+{
+  "mode": "User Study",
+  "max_iterations": 35,
+  "completed_iterations": 0,
+  "preferences": [],
+  "uncertainties": [],
+  "info_gain": [],
+  "query_distance": [
+    2.0
+  ],
+  "parameters": [],
+  "recommendation_history": [],
+  "final_recommendation": [
+    65.94974168602134,
+    41.5496829638062,
+    51.2297031273754,
+    55.91165817377433
+  ],
+  "final_summary": {
+    "recommended_params": [
+      65.94974168602134,
+      41.5496829638062,
+      51.2297031273754,
+      55.91165817377433
+    ],
+    "recommended_score": 0.0,
+    "method": "lbfgsb",
+    "bounds": {
+      "amplitude": [
+        20.0,
+        100.0
+      ],
+      "frequency": [
+        20.0,
+        100.0
+      ],
+      "density": [
+        20.0,
+        100.0
+      ],
+      "gradient": [
+        20.0,
+        100.0
+      ]
+    },
+    "posterior_uncertainty": {
+      "avg_pred_var": 0.9029447243306197,
+      "max_pred_var": 0.9438169212345388
+    },
+    "validation": {
+      "rounds": 0,
+      "win_rate": 0.0,
+      "records": [],
+      "recommended_params": null,
+      "competitor_params": null
+    },
+    "validation_config": null
+  },
+  "metrics": {
+    "info_gain": [],
+    "posterior_best_mean": [],
+    "gt_regret_history": [],
+    "gt_spearman_history": []
+  },
+  "metadata": {
+    "mode": "User Study",
+    "n_queries_planned": 35,
+    "n_queries_completed": 0,
+    "status": "incomplete"
+  },
+  "timestamp": "2026-01-02T01:24:21.172462"
+}

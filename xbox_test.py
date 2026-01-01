@@ -40,9 +40,9 @@ def map_balance_left(slider_val: float) -> float:
 
 
 def map_rhythm_hz(slider_val: float) -> float:
-    # 0.30 .. 4.00 Hz  (min changed to 0.3 Hz)
+    # 0.60 .. 4.00 Hz
     n = norm_20_100(slider_val)
-    return 0.30 + n * 3.70
+    return 0.60 + n * 3.40
 
 
 def map_grain_duty(slider_val: float) -> float:
@@ -60,7 +60,7 @@ def generate_xbox_rumble_segments(intensity_slider, texture_slider, rhythm_slide
     # --- 1) Map to real values ---
     actual_intensity = map_intensity(intensity_slider)      # 0.20..1.00
     a = map_balance_left(texture_slider)                    # left share 0..1
-    actual_speed_hz = map_rhythm_hz(rhythm_slider)          # 0.30..4.00
+    actual_speed_hz = map_rhythm_hz(rhythm_slider)          # 0.60..4.00
     actual_duty = map_grain_duty(grain_slider)              # 0.10..0.70
 
     motor_left = actual_intensity * a
@@ -218,7 +218,7 @@ class XboxVibrationApp:
             "Rhythm",
             "rhythm",
             20, 100, 50,
-            display_fn=lambda v: f"{map_rhythm_hz(v):.2f} Hz (0.30–4.00)"
+            display_fn=lambda v: f"{map_rhythm_hz(v):.2f} Hz (0.60–4.00)"
         )
         self.create_slider(
             control_frame,
