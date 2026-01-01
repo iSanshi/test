@@ -23,8 +23,6 @@ from ..evaluation import (
     posterior_uncertainty,
     recursive_sanitize,
     test_metrics,
-    top_k_by_mean,
-    validation_summary,
 )
 
 
@@ -115,6 +113,10 @@ class ValidationRecord:
     round_index: int
     choice: str
     level: int
+    pair_type: Optional[str] = None
+    predicted_margin: Optional[float] = None
+    model_winner: Optional[str] = None
+    is_aligned: Optional[bool] = None
 
 
 @dataclass
@@ -165,6 +167,7 @@ class PreferenceSession:
         self.validation_recommended: Optional[np.ndarray] = None
         self.validation_competitor: Optional[np.ndarray] = None
         self.validation_config: Optional[Dict[str, object]] = None
+        self.validation_pairs: List[Dict[str, object]] = []
 
         self.gt_best_val: Optional[float] = None
         self.gt_best_params: Optional[np.ndarray] = None
@@ -213,6 +216,7 @@ class PreferenceSession:
         self.validation_recommended = None
         self.validation_competitor = None
         self.validation_config = None
+        self.validation_pairs.clear()
         self.gt_best_val = None
         self.gt_best_params = None
         self.eval_set_best_val = None
@@ -300,67 +304,228 @@ class PreferenceSession:
     def start_validation(self, rounds: Optional[int] = None) -> None:
         if self.state.mode is not SessionMode.USER or self.gp is None:
             return
-        if rounds is not None:
-            self.state.validation_rounds = max(1, int(rounds))
-        if self.state.validation_rounds <= 0:
+        requested_rounds = int(rounds) if rounds is not None else int(self.state.validation_rounds)
+        if requested_rounds <= 0:
             return
         self.state.phase = SessionPhase.VALIDATION
         self.state.validation_index = 0
         self.validation_records.clear()
+        self.validation_pairs.clear()
 
         if self.rec_best.parameters is None or self.rec_best.mean_value is None:
             self.rec_best = self._compute_recommendation()
+        if self.rec_best.parameters is None:
+            return
         self.validation_recommended = np.asarray(self.rec_best.parameters, dtype=float)
+
+        self.state.validation_rounds = 5
 
         bounds = self._physical_bounds()
         bounds_arr = np.asarray(bounds, dtype=float)
         diag = float(np.linalg.norm(bounds_arr[:, 1] - bounds_arr[:, 0]))
         threshold = 0.05 * diag
+        relaxed_threshold = 0.03 * diag
+        max_attempts = int(DEFAULT_VALIDATION_RANDOM_TRIALS)
 
-        top_params, _ = top_k_by_mean(
-            self.gp, bounds, n_samples=5000, k=DEFAULT_VALIDATION_TOP_K
+        def sample_point() -> np.ndarray:
+            return np.array([np.random.uniform(low, high) for low, high in bounds], dtype=float)
+
+        def min_dist(cand: np.ndarray, pts: Sequence[np.ndarray]) -> float:
+            return min(float(np.linalg.norm(cand - p)) for p in pts)
+
+        def far_corner(rec: np.ndarray) -> np.ndarray:
+            lows = bounds_arr[:, 0]
+            highs = bounds_arr[:, 1]
+            choice = np.where((rec - lows) >= (highs - rec), lows, highs)
+            return np.asarray(choice, dtype=float)
+
+        points: List[np.ndarray] = [self.validation_recommended.copy()]
+        primary_attempts = 0
+        while len(points) < 7 and primary_attempts < max_attempts:
+            cand = sample_point()
+            if min_dist(cand, points) >= threshold:
+                points.append(cand)
+            primary_attempts += 1
+
+        relaxed_attempts = 0
+        if len(points) < 7:
+            while len(points) < 7 and relaxed_attempts < max_attempts:
+                cand = sample_point()
+                if min_dist(cand, points) >= relaxed_threshold:
+                    points.append(cand)
+                relaxed_attempts += 1
+
+        fallback_attempts = 0
+        fallback_used = False
+        if len(points) < 7:
+            fallback_used = True
+            while len(points) < 7:
+                best_cand = None
+                best_min = -1.0
+                for _ in range(max_attempts):
+                    cand = sample_point()
+                    if float(np.linalg.norm(cand - points[0])) < threshold:
+                        continue
+                    dist_val = min_dist(cand, points)
+                    if dist_val > best_min:
+                        best_min = dist_val
+                        best_cand = cand
+                if best_cand is None:
+                    best_cand = far_corner(points[0])
+                points.append(best_cand)
+                fallback_attempts += max_attempts
+
+        means = np.asarray(posterior_mean(self.gp, points), dtype=float)
+        sorted_idx = np.argsort(-means)
+        points_sorted = [points[i] for i in sorted_idx]
+        means_sorted = [float(means[i]) for i in sorted_idx]
+
+        def make_pair(
+            a: np.ndarray,
+            b: np.ndarray,
+            mean_a: float,
+            mean_b: float,
+            pair_type: str,
+        ) -> Dict[str, object]:
+            model_winner = "A" if mean_a > mean_b else "B"
+            margin = abs(mean_a - mean_b)
+            return {
+                "A": np.asarray(a, dtype=float),
+                "B": np.asarray(b, dtype=float),
+                "pair_type": pair_type,
+                "mean_a": float(mean_a),
+                "mean_b": float(mean_b),
+                "predicted_margin": float(margin),
+                "model_winner": model_winner,
+            }
+
+        best = points_sorted[0]
+        worst = points_sorted[-1]
+        mid_idx = len(points_sorted) // 2
+        mid = points_sorted[mid_idx]
+
+        round1 = make_pair(best, worst, means_sorted[0], means_sorted[-1], "anchor_easy")
+        round2 = make_pair(best, mid, means_sorted[0], means_sorted[mid_idx], "anchor_medium")
+
+        hard_idx = None
+        hard_margin = None
+        for i in range(len(points_sorted) - 1):
+            if {i, i + 1} == {0, mid_idx}:
+                continue
+            margin = abs(means_sorted[i] - means_sorted[i + 1])
+            if hard_margin is None or margin < hard_margin:
+                hard_margin = margin
+                hard_idx = i
+        if hard_idx is None:
+            hard_idx = 0
+        round3 = make_pair(
+            points_sorted[hard_idx],
+            points_sorted[hard_idx + 1],
+            means_sorted[hard_idx],
+            means_sorted[hard_idx + 1],
+            "hard_local",
         )
-        competitor = None
-        strategy = "top_k"
-        for cand in top_params:
-            if float(np.linalg.norm(cand - self.validation_recommended)) >= threshold:
-                competitor = cand
-                break
 
-        baseline = self.gp.denormalize_parameters(self.gp.initialPoint)
-        baseline_dist = float(np.linalg.norm(baseline - self.validation_recommended))
-        random_trials = 0
+        max_mean = max(means_sorted)
+        min_mean = min(means_sorted)
+        margin_threshold = max(0.3, 0.2 * (max_mean - min_mean))
+        margin_threshold_fallback = 0.15
 
-        if competitor is None:
-            if baseline_dist >= threshold:
-                competitor = baseline
-                strategy = "baseline"
+        def select_global_tradeoff(margin_th: float) -> Optional[Tuple[int, int]]:
+            best_pair = None
+            best_margin = -1.0
+            best_dist = -1.0
+            for i in range(1, len(points_sorted) - 1):
+                for j in range(i + 1, len(points_sorted)):
+                    dist_val = float(np.linalg.norm(points_sorted[i] - points_sorted[j]))
+                    if dist_val < threshold:
+                        continue
+                    margin_val = abs(means_sorted[i] - means_sorted[j])
+                    if margin_val < margin_th:
+                        continue
+                    if margin_val > best_margin or (margin_val == best_margin and dist_val > best_dist):
+                        best_pair = (i, j)
+                        best_margin = margin_val
+                        best_dist = dist_val
+            return best_pair
+
+        global_pair = select_global_tradeoff(margin_threshold)
+        global_strategy = "threshold"
+        if global_pair is None:
+            global_pair = select_global_tradeoff(margin_threshold_fallback)
+            global_strategy = "margin_fallback"
+
+        if global_pair is not None:
+            i, j = global_pair
+            round4 = make_pair(
+                points_sorted[i],
+                points_sorted[j],
+                means_sorted[i],
+                means_sorted[j],
+                "global_tradeoff",
+            )
+        else:
+            fallback_pair = (1, len(points_sorted) - 2)
+            dist_val = float(
+                np.linalg.norm(points_sorted[fallback_pair[0]] - points_sorted[fallback_pair[1]])
+            )
+            if dist_val >= threshold:
+                round4 = make_pair(
+                    points_sorted[fallback_pair[0]],
+                    points_sorted[fallback_pair[1]],
+                    means_sorted[fallback_pair[0]],
+                    means_sorted[fallback_pair[1]],
+                    "global_tradeoff",
+                )
+                global_strategy = "fallback_pair"
             else:
-                strategy = "random_far"
-                lows = bounds_arr[:, 0]
-                highs = bounds_arr[:, 1]
-                best = baseline
-                best_dist = baseline_dist
-                random_trials = DEFAULT_VALIDATION_RANDOM_TRIALS
-                for _ in range(DEFAULT_VALIDATION_RANDOM_TRIALS):
-                    cand = np.random.uniform(lows, highs, size=baseline.shape)
-                    dist = float(np.linalg.norm(cand - self.validation_recommended))
-                    if dist >= threshold:
-                        competitor = cand
+                a = sample_point()
+                b = sample_point()
+                best_dist = float(np.linalg.norm(a - b))
+                for _ in range(max_attempts):
+                    cand_a = sample_point()
+                    cand_b = sample_point()
+                    dist_val = float(np.linalg.norm(cand_a - cand_b))
+                    if dist_val >= threshold:
+                        a, b = cand_a, cand_b
+                        best_dist = dist_val
                         break
-                    if dist > best_dist:
-                        best_dist = dist
-                        best = cand
-                if competitor is None:
-                    competitor = best
+                    if dist_val > best_dist:
+                        a, b = cand_a, cand_b
+                        best_dist = dist_val
+                mean_a, mean_b = posterior_mean(self.gp, [a, b])
+                round4 = make_pair(a, b, float(mean_a), float(mean_b), "global_tradeoff")
+                global_strategy = "random_far"
 
-        self.validation_competitor = np.asarray(competitor, dtype=float)
+        round5 = make_pair(
+            round2["B"],
+            round2["A"],
+            round2["mean_b"],
+            round2["mean_a"],
+            "consistency_check",
+        )
+
+        self.validation_pairs = [round1, round2, round3, round4, round5]
+        self.validation_competitor = np.asarray(worst, dtype=float)
         self.validation_config = {
-            "threshold": float(threshold),
-            "strategy": strategy,
-            "top_k": int(DEFAULT_VALIDATION_TOP_K),
-            "random_trials": int(random_trials),
+            "strategy": "smcc",
+            "requested_rounds": int(requested_rounds),
+            "rounds": int(self.state.validation_rounds),
+            "set_size": int(len(points)),
             "diag": float(diag),
+            "threshold": float(threshold),
+            "relaxed_threshold": float(relaxed_threshold),
+            "max_attempts": int(max_attempts),
+            "sampling_attempts": {
+                "primary": int(primary_attempts),
+                "relaxed": int(relaxed_attempts),
+                "fallback": int(fallback_attempts),
+                "fallback_used": bool(fallback_used),
+            },
+            "margin_threshold": float(margin_threshold),
+            "margin_threshold_fallback": float(margin_threshold_fallback),
+            "global_tradeoff_strategy": global_strategy,
+            "pair_types": [pair["pair_type"] for pair in self.validation_pairs],
         }
 
     # ------------------------------------------------------------------ #
@@ -414,11 +579,17 @@ class PreferenceSession:
             or self.gp is None
         ):
             return None
-        if self.validation_recommended is None or self.validation_competitor is None:
-            return None
-
-        p1_phys = np.asarray(self.validation_recommended, dtype=float)
-        p2_phys = np.asarray(self.validation_competitor, dtype=float)
+        if self.validation_pairs:
+            if self.state.validation_index >= len(self.validation_pairs):
+                return None
+            pair = self.validation_pairs[self.state.validation_index]
+            p1_phys = np.asarray(pair["A"], dtype=float)
+            p2_phys = np.asarray(pair["B"], dtype=float)
+        else:
+            if self.validation_recommended is None or self.validation_competitor is None:
+                return None
+            p1_phys = np.asarray(self.validation_recommended, dtype=float)
+            p2_phys = np.asarray(self.validation_competitor, dtype=float)
         p1_norm = self.gp.normalize_parameters(p1_phys)
         p2_norm = self.gp.normalize_parameters(p2_phys)
         dist = float(np.linalg.norm(p1_norm - p2_norm))
@@ -478,8 +649,23 @@ class PreferenceSession:
         if self.state.phase is not SessionPhase.VALIDATION:
             return
         level = int(np.clip(level, 1, 5))
+        pair_meta = None
+        if 0 <= self.state.validation_index < len(self.validation_pairs):
+            pair_meta = self.validation_pairs[self.state.validation_index]
+        pair_type = pair_meta.get("pair_type") if pair_meta else None
+        predicted_margin = pair_meta.get("predicted_margin") if pair_meta else None
+        model_winner = pair_meta.get("model_winner") if pair_meta else None
+        is_aligned = None
+        if model_winner in ("A", "B"):
+            is_aligned = choice_label == model_winner
         record = ValidationRecord(
-            round_index=self.state.validation_index + 1, choice=choice_label, level=level
+            round_index=self.state.validation_index + 1,
+            choice=choice_label,
+            level=level,
+            pair_type=pair_type,
+            predicted_margin=predicted_margin,
+            model_winner=model_winner,
+            is_aligned=is_aligned,
         )
         self.validation_records.append(record)
         self.state.validation_index += 1
@@ -650,6 +836,71 @@ class PreferenceSession:
             bounds_dict[canonical] = [float(bounds[0]), float(bounds[1])]
         return bounds_dict
 
+    def _build_validation_summary(self) -> Dict[str, object]:
+        rounds = len(self.validation_records)
+        wins = sum(1 for rec in self.validation_records if getattr(rec, "choice", "") == "A")
+        win_rate = wins / rounds if rounds else 0.0
+
+        records = []
+        aligned_count = 0
+        margin_sum = 0.0
+        weighted_sum = 0.0
+        round2_choice = None
+        round5_choice = None
+
+        for rec in self.validation_records:
+            predicted_margin = float(rec.predicted_margin) if rec.predicted_margin is not None else None
+            records.append(
+                {
+                    "round": int(rec.round_index),
+                    "choice": rec.choice,
+                    "level": int(rec.level),
+                    "pair_type": rec.pair_type,
+                    "predicted_margin": predicted_margin,
+                    "model_winner": rec.model_winner,
+                    "is_aligned": rec.is_aligned,
+                }
+            )
+            if rec.is_aligned:
+                aligned_count += 1
+            if predicted_margin is not None:
+                margin_sum += predicted_margin
+                if rec.is_aligned:
+                    weighted_sum += predicted_margin
+            if rec.pair_type == "anchor_medium":
+                round2_choice = rec.choice
+            if rec.pair_type == "consistency_check":
+                round5_choice = rec.choice
+
+        planned_rounds = max(1, int(self.state.validation_rounds))
+        agreement_rate = aligned_count / float(planned_rounds) if planned_rounds else 0.0
+        weighted_agreement = weighted_sum / margin_sum if margin_sum > 0 else None
+
+        consistency_pass = None
+        if round2_choice in ("A", "B") and round5_choice in ("A", "B"):
+            consistency_pass = (round2_choice == "A" and round5_choice == "B") or (
+                round2_choice == "B" and round5_choice == "A"
+            )
+
+        return {
+            "rounds": rounds,
+            "win_rate": float(win_rate),
+            "records": records,
+            "recommended_params": (
+                list(map(float, np.asarray(self.validation_recommended, dtype=float).tolist()))
+                if self.validation_recommended is not None
+                else None
+            ),
+            "competitor_params": (
+                list(map(float, np.asarray(self.validation_competitor, dtype=float).tolist()))
+                if self.validation_competitor is not None
+                else None
+            ),
+            "agreement_rate": float(agreement_rate),
+            "weighted_agreement": float(weighted_agreement) if weighted_agreement is not None else None,
+            "consistency_pass": consistency_pass,
+        }
+
     def build_snapshot(self, status: str = "complete") -> Dict[str, object]:
         recommended = self.rec_best
         if (recommended.parameters is None or recommended.mean_value is None) and self.gp is not None:
@@ -678,9 +929,7 @@ class PreferenceSession:
         }
 
         if self.state.mode is SessionMode.USER:
-            final_summary["validation"] = validation_summary(
-                self.validation_records, self.validation_recommended, self.validation_competitor
-            )
+            final_summary["validation"] = self._build_validation_summary()
             final_summary["validation_config"] = self.validation_config
 
         if (

@@ -1,0 +1,15 @@
+[05:24:25] [System] Gamepad Service Started (Multiprocess).
+[05:24:27] [System] Session Started.
+[05:24:27] [System] Rumble params: I/T/R/G in [20,100], duration=3.0s to Xbox controller.
+[05:24:30] [User] Iter 01 | A [I=0.20, T=L0%/R100%, R=0.60Hz, G=10% | s=20.0,20.0,20.0,20.0] vs B [I=1.00, T=L100%/R0%, R=4.00Hz, G=70% | s=100.0,100.0,100.0,100.0] | pick=B | level=4 | EIG=0.920, Dist=2.000
+[05:24:32] [User] Iter 02 | A [I=0.20, T=L100%/R0%, R=0.60Hz, G=70% | s=20.0,100.0,20.0,100.0] vs B [I=1.00, T=L0%/R100%, R=4.00Hz, G=10% | s=100.0,20.0,100.0,20.0] | pick=A | level=3 | EIG=0.918, Dist=2.000
+[05:24:34] [User] Iter 03 | A [I=1.00, T=L0%/R100%, R=0.60Hz, G=70% | s=100.0,20.0,20.0,100.0] vs B [I=0.20, T=L100%/R0%, R=4.00Hz, G=10% | s=20.0,100.0,100.0,20.0] | pick=B | level=2 | EIG=0.917, Dist=2.000
+[05:24:36] [User] Iter 04 | A [I=0.20, T=L0%/R100%, R=4.00Hz, G=70% | s=20.0,20.0,100.0,100.0] vs B [I=1.00, T=L100%/R0%, R=0.60Hz, G=10% | s=100.0,100.0,20.0,20.0] | pick=A | level=4 | EIG=0.916, Dist=2.000
+[05:24:39] [User] Iter 05 | A [I=0.20, T=L0%/R100%, R=0.60Hz, G=56% | s=20.0,20.0,20.0,81.7] vs B [I=1.00, T=L100%/R0%, R=4.00Hz, G=10% | s=100.0,100.0,100.0,20.0] | pick=B | level=4 | EIG=0.897, Dist=1.896
+[05:24:39] [System] Validation rounds started (5).
+[05:24:42] [Validation] Val 01 | A [I=0.38, T=L100%/R0%, R=4.00Hz, G=70% | s=38.5,100.0,100.0,100.0] vs B [I=0.21, T=L72%/R28%, R=0.63Hz, G=15% | s=21.3,77.7,20.6,26.8] | pick=A | level=4 | Dist=1.395
+[05:24:45] [Validation] Val 02 | A [I=0.38, T=L100%/R0%, R=4.00Hz, G=70% | s=38.5,100.0,100.0,100.0] vs B [I=0.38, T=L88%/R12%, R=1.84Hz, G=42% | s=38.0,90.0,49.1,63.2] | pick=A | level=5 | Dist=0.795
+[05:24:47] [Validation] Val 03 | A [I=0.38, T=L88%/R12%, R=1.84Hz, G=42% | s=38.0,90.0,49.1,63.2] vs B [I=0.44, T=L42%/R58%, R=2.14Hz, G=66% | s=43.9,53.5,56.2,94.6] | pick=B | level=2 | Dist=0.613
+[05:24:50] [Validation] Val 04 | A [I=0.67, T=L95%/R5%, R=2.49Hz, G=40% | s=67.0,95.9,64.5,60.0] vs B [I=0.21, T=L72%/R28%, R=0.63Hz, G=15% | s=21.3,77.7,20.6,26.8] | pick=A | level=3 | Dist=0.923
+[05:24:51] [Validation] Val 05 | A [I=0.38, T=L88%/R12%, R=1.84Hz, G=42% | s=38.0,90.0,49.1,63.2] vs B [I=0.38, T=L100%/R0%, R=4.00Hz, G=70% | s=38.5,100.0,100.0,100.0] | pick=B | level=3 | Dist=0.795
+[05:24:51] [System] Session Complete!

@@ -892,6 +892,8 @@ class AudioPreferenceStudyApp:
         dialog.configure(bg=COLOR_PANEL)
         dialog.resizable(False, False)
         dialog.transient(self.root)
+        dialog.update_idletasks()
+        dialog.wait_visibility()
         dialog.grab_set()
 
         frame = tk.Frame(dialog, bg=COLOR_PANEL, padx=24, pady=20)
@@ -1224,6 +1226,8 @@ class AudioPreferenceStudyApp:
 
     # --- GAMEPAD POLLING ---
     def _poll_gamepad_queue(self):
+        if self._closing:
+            return
         try:
             while not self.gp_state_q.empty():
                 evt_type, data = self.gp_state_q.get_nowait()
@@ -1253,7 +1257,11 @@ class AudioPreferenceStudyApp:
         except queue.Empty:
             pass
         finally:
-            self.root.after(20, self._poll_gamepad_queue)
+            if not self._closing:
+                try:
+                    self.root.after(20, self._poll_gamepad_queue)
+                except Exception:
+                    pass
 
     def _on_close(self):
         self._closing = True
@@ -1268,13 +1276,33 @@ class AudioPreferenceStudyApp:
         if not self._exported_data:
             status = "complete" if self.session.is_complete() else "incomplete"
             self._persist_study_data(status=status)
-        try: self.session.audio.stop_audio()
-        except: pass
+        try:
+            self.session.audio.stop_audio()
+        except Exception:
+            pass
+        try:
+            self.session.audio.close()
+        except Exception:
+            pass
         if self.gp_process.is_alive():
-            self.gp_cmd_q.put("STOP")
+            try:
+                self.gp_cmd_q.put("STOP")
+            except Exception:
+                pass
             self.gp_process.join(timeout=0.5)
             if self.gp_process.is_alive():
                 self.gp_process.terminate()
+                self.gp_process.join(timeout=0.5)
+        try:
+            self.gp_state_q.close()
+            self.gp_state_q.join_thread()
+        except Exception:
+            pass
+        try:
+            self.gp_cmd_q.close()
+            self.gp_cmd_q.join_thread()
+        except Exception:
+            pass
         self.root.destroy()
 
 def user_main() -> int:
