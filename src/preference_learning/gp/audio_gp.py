@@ -76,43 +76,9 @@ class AudioPreferenceGaussianProcess(GaussianProcess):
     # ------------------------------------------------------------------ #
     # Query optimisation
     # ------------------------------------------------------------------ #
-    def find_optimal_query(self, n_restarts: int = 5) -> Tuple[np.ndarray, float]:
+    def find_optimal_query(self, n_restarts: int = 1) -> Tuple[np.ndarray, float]:
         """Return the best next query (two 4D points) and its information gain."""
-
-        def negative_info_gain(x: np.ndarray) -> float:
-            return -1.0 * self.objective_entropy(x)
-
-        bounds = [(0.0, 1.0)] * 8
-        best_result = None
-        best_info_gain = -np.inf
-
-        for _ in range(max(n_restarts, 1)):
-            base_point = np.concatenate([self.initialPoint, self.initialPoint])
-            perturbation = np.random.uniform(-0.3, 0.3, 8)
-            start = np.clip(base_point + perturbation, 0.0, 1.0)
-
-            try:
-                opt_res = minimize(
-                    negative_info_gain,
-                    x0=start,
-                    bounds=bounds,
-                    method="L-BFGS-B",
-                    options={"ftol": 1e-9, "gtol": 1e-6},
-                )
-                info_gain = -opt_res.fun
-                if info_gain > best_info_gain:
-                    best_info_gain = info_gain
-                    best_result = opt_res.x
-            except Exception:
-                continue
-
-        if best_result is None:
-            start = np.random.uniform(0.0, 1.0, 8)
-            opt_res = minimize(negative_info_gain, x0=start, bounds=bounds, method="L-BFGS-B")
-            best_result = opt_res.x
-            best_info_gain = -opt_res.fun
-
-        return best_result, best_info_gain
+        return super().find_optimal_query(n_restarts=n_restarts)
 
     def find_recommendation(
         self, n_restarts: int = 5, n_samples: int = 5000

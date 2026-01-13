@@ -1,3 +1,0 @@
-[01:24:12] [System] Gamepad Service Started (Multiprocess).
-[01:24:14] [System] Session Started.
-[01:24:14] [System] Rumble params: I/T/R/G in [20,100], duration=3.0s to Xbox controller.

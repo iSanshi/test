@@ -1,0 +1,20 @@
+{
+  "timestamp": "2026-01-06T05:38:09.950197",
+  "slider": {
+    "intensity": 66.0,
+    "texture": 73.0,
+    "rhythm": 43.0,
+    "grain": 80.0,
+    "duration_ms": 3000
+  },
+  "signal": {
+    "intensity": 0.6599999999999999,
+    "left_share": 0.6625,
+    "right_share": 0.3375,
+    "speed_hz": 1.5775,
+    "duty": 0.5499999999999999,
+    "duration_s": 3.0
+  },
+  "favorite_index": 1,
+  "favorite_total": 3
+}

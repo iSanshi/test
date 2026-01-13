@@ -12,7 +12,6 @@ from scipy.stats import norm
 
 def binary_entropy(probability: float) -> float:
     """Return the binary entropy for the given Bernoulli probability."""
-    probability = np.clip(probability, 1e-12, 1 - 1e-12)
     return -probability * np.log2(probability) - (1 - probability) * np.log2(1 - probability)
 
 

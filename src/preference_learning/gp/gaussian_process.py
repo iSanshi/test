@@ -12,14 +12,12 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from numpy.linalg import inv
-from scipy.optimize import minimize
+from scipy.optimize import fmin_l_bfgs_b, minimize
 from scipy.stats import multivariate_normal
 
 from .math_utils import (
     h,
     normal_cdf,
-    normal_pdf,
-    normal_pdf_second_derivative,
     phi,
     phip,
     phipp,
@@ -49,6 +47,7 @@ class GaussianProcess:
     
     uncertainty_sigma_dict: UncertaintySigmaDict = field(
         default_factory=lambda: {1: 0.01, 2: 0.66, 3: 1.7, 4: 3.35, 5: 9.0}
+
     )
 
 
@@ -103,24 +102,82 @@ class GaussianProcess:
         xa = concatenated_points[: self.dim]
         xb = concatenated_points[self.dim :]
 
-        cov_matrix = self.postcov(xa, xb)
+        matCov = self.postcov(xa, xb)
         mua, mub = self.postmean(xa, xb)
         sigmap = np.sqrt(np.pi * np.log(2) / 2) * self.noise
 
-        variance_term = (
-            2 * self.noise**2 + cov_matrix[0][0] + cov_matrix[1][1] - 2 * cov_matrix[0][1]
+        result1 = h(
+            phi(
+                (mua - mub)
+                / np.sqrt(
+                    2 * self.noise**2 + matCov[0][0] + matCov[1][1] - 2 * matCov[0][1]
+                )
+            )
         )
-        std = np.sqrt(max(variance_term, 1e-12))
-
-        expectation = h(phi((mua - mub) / std))
-        correction = (
+        result2 = (
             sigmap
-            * np.exp(-0.5 * (mua - mub) ** 2 / (sigmap**2 + variance_term))
-            / np.sqrt(sigmap**2 + variance_term)
+            * 1
+            / np.sqrt(sigmap**2 + matCov[0][0] + matCov[1][1] - 2 * matCov[0][1])
+            * np.exp(
+                -0.5
+                * (mua - mub) ** 2
+                / (sigmap**2 + matCov[0][0] + matCov[1][1] - 2 * matCov[0][1])
+            )
         )
-        return expectation - correction
+
+        return result1 - result2
 
     objectiveEntropy = objective_entropy
+
+    # ------------------------------------------------------------------ #
+    # Query optimization (shared with auto-test UI)
+    # ------------------------------------------------------------------ #
+    def find_optimal_query(self, n_restarts: int = 5) -> Tuple[np.ndarray, float]:
+        """Return the best next query (two points) and its information gain."""
+
+        def negative_info_gain(x: np.ndarray) -> float:
+            return -1 * self.objective_entropy(x)
+
+        bounds = [(0.0, 1.0)] * (2 * self.dim)
+        best_result = None
+        best_info_gain = -np.inf
+
+        for _ in range(max(n_restarts, 1)):
+            base_point = np.array(list(self.initialPoint) * 2)
+            lower = np.zeros_like(base_point)
+            upper = np.ones_like(base_point)
+            start = base_point + np.random.uniform(lower - base_point, upper - base_point)
+
+            try:
+                opt_res = fmin_l_bfgs_b(
+                    negative_info_gain,
+                    x0=start,
+                    bounds=bounds,
+                    approx_grad=True,
+                    factr=0.1,
+                    iprint=-1,
+                )
+                info_gain = -opt_res[1]
+                if info_gain > best_info_gain:
+                    best_info_gain = info_gain
+                    best_result = opt_res[0]
+            except Exception:
+                continue
+
+        if best_result is None:
+            start = np.random.uniform(0.0, 1.0, 2 * self.dim)
+            opt_res = fmin_l_bfgs_b(
+                negative_info_gain,
+                x0=start,
+                bounds=bounds,
+                approx_grad=True,
+                factr=0.1,
+                iprint=-1,
+            )
+            best_result = opt_res[0]
+            best_info_gain = -opt_res[1]
+
+        return np.asarray(best_result, dtype=float), float(best_info_gain)
 
     # ------------------------------------------------------------------ #
     # Posterior calculations
@@ -147,53 +204,60 @@ class GaussianProcess:
         xb: Union[Sequence[float], np.ndarray],
     ) -> float:
         """Squared exponential kernel."""
-        xa_arr = _as_array(xa)
-        xb_arr = _as_array(xb)
-        diff_norm = np.linalg.norm(xa_arr - xb_arr)
-        value = float(np.exp(-self.theta * diff_norm**2))
-
-        if value < 0:
-            raise ValueError("Kernel value cannot be negative.")
-        return value
+        ker = 1 * (np.exp(-self.theta * np.linalg.norm(np.array(xa) - np.array(xb)) ** 2))
+        try:
+            ker = ker[0]
+        except Exception:
+            pass
+        if ker < 0:
+            print("You can not have a negative kernel!")
+            raise SystemExit(1)
+        return ker
 
     def batch_kernel(self, xa: np.ndarray, xb: np.ndarray) -> np.ndarray:
         """Batch kernel evaluation for a matrix of points."""
-        if xa.ndim != 2:
-            raise ValueError("Expected xa to be a 2D array.")
-        xb_tiled = np.repeat(_as_array(xb).reshape(1, -1), xa.shape[0], axis=0)
-        return np.exp(-self.theta * np.linalg.norm(xa - xb_tiled, axis=1) ** 2)
+        num = xa.shape[0]
+        xb = np.repeat(np.array(xb).reshape(1, -1), num, axis=0)
+        return np.exp(-self.theta * np.linalg.norm(np.array(xa) - np.array(xb), axis=1) ** 2)
 
     def _posterior_mode(self) -> np.ndarray:
         """Find posterior means for the queries."""
         num_queries = len(self.listQueries)
         Kinv = self.Kinv
-        answers = np.array([q[2] for q in self.listQueries], dtype=float)
-        sigmas = np.array(
-            [self.uncertainty_sigma_dict.get(q[3], 1.7) for q in self.listQueries],
-            dtype=float,
-        )
+        listResults = np.array([q[2] for q in self.listQueries])
+        sigmas = np.array([self.uncertainty_sigma_dict[q[3]] for q in self.listQueries])
 
         def logposterior(f: np.ndarray) -> float:
             fodd = f[1::2]
             feven = f[::2]
-            fint = (feven - fodd) / self.noise
-            res = normal_cdf(np.multiply(fint, answers), scale=sigmas[:num_queries])
+            fint = 1 / self.noise * (feven - fodd)
+            res = np.multiply(fint, listResults)
+            res = res.astype(dtype=np.float64)
+            res = normal_cdf(res, scale=sigmas[:num_queries])
             res[res == 0] = 1e-100
-            log_res = np.log(res).sum()
+            res = np.log(res)
+            res = np.sum(res)
             ftransp = f.reshape(-1, 1)
-            quadratic = 0.5 * np.matmul(f, np.matmul(Kinv, ftransp))
-            return -1 * (log_res - quadratic)
+            return -1 * (res - 0.5 * np.matmul(f, np.matmul(Kinv, ftransp)))
 
         def gradientlog(f: np.ndarray) -> np.ndarray:
             grad = np.zeros(2 * len(self.listQueries))
-            for i, (_, _, sign, level) in enumerate(self.listQueries):
+            for i in range(len(self.listQueries)):
+                signe = self.listQueries[i][2]
                 diff = f[2 * i] - f[2 * i + 1]
-                sigma = self.uncertainty_sigma_dict.get(level, 1.7)
-                temp = phi(sign * diff / self.noise, sigma=sigma)
-                temp = temp if temp != 0 else 1e-100
-                common = phip(sign * diff / self.noise, sigma=sigma) / (self.noise * temp)
-                grad[2 * i] = sign * common
-                grad[2 * i + 1] = -sign * common
+                temp = phi(signe * 1 / self.noise * (diff), sigma=sigmas[i])
+                if temp == 0:
+                    temp = 1e-100
+                grad[2 * i] = (
+                    signe
+                    * (phip(signe * 1 / self.noise * (diff), sigma=sigmas[i]) * 1 / self.noise)
+                    / temp
+                )
+                grad[2 * i + 1] = (
+                    signe
+                    * (-phip(signe * 1 / self.noise * (diff), sigma=sigmas[i]) * 1 / self.noise)
+                    / temp
+                )
             grad = grad - f @ Kinv
             return -grad
 
@@ -207,14 +271,17 @@ class GaussianProcess:
         n = len(self.listQueries)
         W = np.zeros((2 * n, 2 * n))
         for i in range(n):
-            sign = self.listQueries[i][2]
-            diff = sign * (self.fqmean[2 * i] - self.fqmean[2 * i + 1]) / self.noise
-            numerator = (
-                normal_pdf_second_derivative(diff) * phi(diff)
-                - normal_pdf(diff) ** 2
+            dif = (
+                self.listQueries[i][2]
+                * 1
+                / self.noise
+                * (self.fqmean[2 * i] - self.fqmean[2 * i + 1])
             )
-            denominator = phi(diff) ** 2
-            W[2 * i][2 * i] = -(numerator / (self.noise**2 * denominator))
+            W[2 * i][2 * i] = (
+                -(1 / self.noise**2)
+                * (phipp(dif) * phi(dif) - phip(dif) ** 2)
+                / (phi(dif) ** 2)
+            )
             W[2 * i + 1][2 * i] = -W[2 * i][2 * i]
             W[2 * i][2 * i + 1] = -W[2 * i][2 * i]
             W[2 * i + 1][2 * i + 1] = W[2 * i][2 * i]
@@ -280,9 +347,9 @@ class GaussianProcess:
         return post_cov
 
     def cov1pt(self, x: np.ndarray) -> float:
-        return self.postcov(x, np.zeros_like(x))[0][0]
+        return self.postcov(x, 0)[0][0]
 
     def mean1pt(self, x: np.ndarray, eval: bool = False) -> Union[float, np.ndarray]:
         if eval:
-            return self.postmean(x, np.zeros_like(x), eval=True)
-        return self.postmean(x, np.zeros_like(x))[0]
+            return self.postmean(x, 0, eval=True)
+        return self.postmean(x, 0)[0]

@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk, messagebox
-from typing import Optional, Sequence, Callable, List, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, Sequence, Callable, Dict, List, Tuple
 import threading
 import time
 import numpy as np
@@ -24,6 +25,8 @@ import matplotlib.style
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
+DEFAULT_MAX_ITERS = 4
+
 # Use default (light) style
 matplotlib.style.use('default')
 
@@ -33,7 +36,7 @@ matplotlib.rcParams.update({
     "axes.unicode_minus": False
 })
 
-from .session import PreferenceSession, SessionMode, SessionPhase, GroundTruthKind
+from .session import PreferenceSession, SessionMode, SessionPhase, GroundTruthKind, DEFAULT_VALIDATION_ROUNDS
 from ..audio.generator import (
     DEFAULT_OUTPUT_DEVICE,
     OUTPUT_DEVICE_LABELS,
@@ -65,12 +68,69 @@ COLOR_MUTED = "#6b7280"     # Secondary Text
 COLOR_BORDER = "#e5e7eb"
 
 UNCERTAINTY_DESCRIPTIONS = {
-    1: "Very unsure (非常不确定)",
-    2: "Somewhat unsure (有点不确定)",
-    3: "Neutral (中立)",
-    4: "Somewhat sure (有点确定)",
-    5: "Very sure (非常确定)",
+    1: "Very unsure",
+    2: "Somewhat unsure",
+    3: "Neutral",
+    4: "Somewhat sure",
+    5: "Very sure",
 }
+
+
+@dataclass
+class AutoTestPlotConfig:
+    resolution: int = 31
+    update_every: int = 1
+    min_interval_s: float = 0.0
+
+
+@dataclass
+class AutoTestConfig:
+    max_iterations: int = DEFAULT_MAX_ITERS
+    gt_label: str = GroundTruthKind.GAUSSIAN_CENTER.value
+    seed: Optional[int] = None
+    param_ranges: Optional[Dict[str, Tuple[float, float]]] = None
+    plot: AutoTestPlotConfig = field(default_factory=AutoTestPlotConfig)
+
+
+CANONICAL_PARAM_ORDER = ("intensity", "texture", "rhythm", "grain")
+LEGACY_PARAM_ORDER = ("amplitude", "frequency", "density", "gradient")
+CANONICAL_TO_LEGACY = dict(zip(CANONICAL_PARAM_ORDER, LEGACY_PARAM_ORDER))
+LEGACY_TO_CANONICAL = {legacy: canonical for canonical, legacy in CANONICAL_TO_LEGACY.items()}
+
+UI_PARAM_RANGES = {
+    "amplitude": (20.0, 100.0),
+    "frequency": (20.0, 100.0),
+    "density": (20.0, 100.0),
+    "gradient": (20.0, 100.0),
+}
+
+
+
+
+def _canonicalize_param_ranges(
+    ranges: Optional[Dict[str, Tuple[float, float]]]
+) -> Dict[str, Tuple[float, float]]:
+    canonical: Dict[str, Tuple[float, float]] = {}
+    if ranges:
+        for key, bounds in ranges.items():
+            key = str(key)
+            if key in CANONICAL_TO_LEGACY:
+                canonical[key] = (float(bounds[0]), float(bounds[1]))
+            elif key in LEGACY_TO_CANONICAL:
+                canonical[LEGACY_TO_CANONICAL[key]] = (float(bounds[0]), float(bounds[1]))
+    return canonical
+
+
+def _to_legacy_param_ranges(
+    canonical_ranges: Dict[str, Tuple[float, float]]
+) -> Dict[str, Tuple[float, float]]:
+    legacy: Dict[str, Tuple[float, float]] = {}
+    for canonical, legacy_key in CANONICAL_TO_LEGACY.items():
+        bounds = canonical_ranges.get(canonical)
+        if bounds is None:
+            continue
+        legacy[legacy_key] = (float(bounds[0]), float(bounds[1]))
+    return legacy
 
 # -------------------------------------------------------------------------
 # MULTIPROCESSING WORKER FOR PYGAME
@@ -253,7 +313,7 @@ class GamepadFocusManager:
                 continue
                 
             # Skip if it is the SAME button we are already on (e.g. moving right inside a wide button)
-            if candidate is current_button:
+            if candidate is current_btn:
                 continue
                 
             # 3. Validation Logic
@@ -290,10 +350,6 @@ class GamepadFocusManager:
             if 0 <= self.current_col < len(row):
                 return row[self.current_col]
         return None
-
-# Global alias for skip logic check
-current_button = None 
-
 
 class GameButton(tk.Frame):
     """Custom styled button that supports 'focus' state."""
@@ -356,13 +412,27 @@ class GameButton(tk.Frame):
 
 
 class AudioPreferenceStudyApp:
-    def __init__(self, root: tk.Tk, session: Optional[PreferenceSession] = None, fixed_mode: Optional[SessionMode] = None):
+    def __init__(
+        self,
+        root: tk.Tk,
+        session: Optional[PreferenceSession] = None,
+        fixed_mode: Optional[SessionMode] = None,
+        auto_test_config: Optional[AutoTestConfig] = None,
+        auto_close_on_complete: bool = False,
+    ):
         self.root = root
         self.root.title("Haptic Preference Learning — Gamepad UI")
         self.root.geometry("1280x800")
         self.root.configure(bg=COLOR_BG)
         
         self.session = session or PreferenceSession()
+        self.auto_test_config = auto_test_config or AutoTestConfig()
+        canonical_ranges = _canonicalize_param_ranges(self.auto_test_config.param_ranges)
+        default_ranges = _canonicalize_param_ranges(UI_PARAM_RANGES)
+        for key, bounds in default_ranges.items():
+            canonical_ranges.setdefault(key, bounds)
+        self._canonical_param_ranges = canonical_ranges
+        self.session.audio.param_ranges = _to_legacy_param_ranges(self._canonical_param_ranges)
         try:
             self.session.audio.set_output_device("xbox_controller")
             self.session.audio.duration = 3
@@ -376,15 +446,24 @@ class AudioPreferenceStudyApp:
         self.current_candidate = None
         self.current_audio_data = {}
         self.selected_choice = None
-        self.level_var = tk.IntVar(value=3)
+        self.level_var = tk.IntVar(value=0)
+        self._uncertainty_selected = False
         self.auto_play_var = tk.BooleanVar(value=False)
         self._icons = {}
         self._closing = False
+        self._dialog_active = False
+        self._auto_close_on_complete = auto_close_on_complete
         self._test_poll_job: Optional[str] = None
         self._last_drawn_test_iteration: int = -1
         self._last_logged_test_record: int = 0
+        self._map_last_draw_time: float = 0.0
+        self._map_cache: Dict[str, object] = {}
+        self._map_axes: Optional[Dict[str, object]] = None
+        self._map_artists: Dict[str, object] = {}
         self._exported_data: bool = False
-        self.validation_rounds: int = 3
+        self.validation_rounds: int = DEFAULT_VALIDATION_ROUNDS
+        self._gamepad_poll_job: Optional[str] = None
+        self._pygame_poll_job: Optional[str] = None
 
         # UI Layout
         self._setup_layout()
@@ -414,7 +493,10 @@ class AudioPreferenceStudyApp:
             _safe_pump_events()
         except Exception:
             pass
-        self.root.after(50, self._poll_pygame_events)
+        try:
+            self._pygame_poll_job = self.root.after(50, self._poll_pygame_events)
+        except Exception:
+            self._pygame_poll_job = None
 
     def _load_icon(self, name: str, max_height: int = 64) -> Optional[tk.PhotoImage]:
         if name in self._icons: return self._icons[name]
@@ -463,7 +545,13 @@ class AudioPreferenceStudyApp:
         # Session Card
         self.card_session = tk.LabelFrame(left_panel, text=" Session ", bg=COLOR_PANEL, fg=COLOR_MUTED, font=("Helvetica", 10))
         self.card_session.pack(fill=tk.X, pady=10)
-        self.iter_label = tk.Label(self.card_session, text="Iteration: 0 / 35", bg=COLOR_PANEL, fg=COLOR_ACCENT, font=("Helvetica", 16, "bold"))
+        self.iter_label = tk.Label(
+            self.card_session,
+            text=f"Iteration: 0 / {DEFAULT_MAX_ITERS}",
+            bg=COLOR_PANEL,
+            fg=COLOR_ACCENT,
+            font=("Helvetica", 16, "bold"),
+        )
         self.iter_label.pack(pady=(10, 5))
         
         btn_frame_1 = tk.Frame(self.card_session, bg=COLOR_PANEL)
@@ -510,16 +598,36 @@ class AudioPreferenceStudyApp:
         
         row_ab = tk.Frame(self.card_choice, bg=COLOR_PANEL)
         row_ab.pack(pady=10)
-        self.btn_choose_a = GameButton(row_ab, "Prefer A", command=lambda: self._choose("A"), width=150, bg=COLOR_PANEL)
+        self.btn_choose_a = GameButton(
+            row_ab,
+            "Prefer A",
+            command=lambda: self._choose("A"),
+            on_focus=lambda: self._set_wave_display(1),
+            width=150,
+            bg=COLOR_PANEL,
+        )
         self.btn_choose_a.pack(side=tk.LEFT, padx=10)
-        self.btn_choose_b = GameButton(row_ab, "Prefer B", command=lambda: self._choose("B"), width=150, bg=COLOR_PANEL)
+        self.btn_choose_b = GameButton(
+            row_ab,
+            "Prefer B",
+            command=lambda: self._choose("B"),
+            on_focus=lambda: self._set_wave_display(2),
+            width=150,
+            bg=COLOR_PANEL,
+        )
         self.btn_choose_b.pack(side=tk.LEFT, padx=10)
         self.btn_choose_a.set_state("disabled")
         self.btn_choose_b.set_state("disabled")
 
         lbl_unc = tk.Label(self.card_choice, text="Uncertainty Level", bg=COLOR_PANEL, fg=COLOR_MUTED)
         lbl_unc.pack(pady=(10, 0))
-        self.unc_desc_label = tk.Label(self.card_choice, text="Neutral", bg=COLOR_PANEL, fg=COLOR_ACCENT, font=("Helvetica", 11, "bold"))
+        self.unc_desc_label = tk.Label(
+            self.card_choice,
+            text="Select level",
+            bg=COLOR_PANEL,
+            fg=COLOR_ACCENT,
+            font=("Helvetica", 11, "bold"),
+        )
         self.unc_desc_label.pack(pady=(0, 10))
 
         unc_row = tk.Frame(self.card_choice, bg=COLOR_PANEL)
@@ -623,18 +731,42 @@ class AudioPreferenceStudyApp:
     def _start_session(self):
         try:
             mode = SessionMode.USER if self.mode_var.get() == SessionMode.USER.value else SessionMode.TEST
+            if mode is SessionMode.TEST:
+                cfg = self.auto_test_config
+                max_iters = max(1, int(cfg.max_iterations))
+                gt_label = cfg.gt_label
+                seed = cfg.seed
+            else:
+                max_iters = DEFAULT_MAX_ITERS
+                gt_label = GroundTruthKind.GAUSSIAN_CENTER.value
+                seed = None
             self.session.start(
                 mode,
-                35,
-                GroundTruthKind.GAUSSIAN_CENTER.value,
+                max_iters,
+                gt_label,
+                seed=seed,
                 validation_rounds=self.validation_rounds,
             )
             self._exported_data = False
-            self._last_drawn_test_iteration = -1
+            self._reset_map_cache()
             self._last_logged_test_record = 0
             self._cancel_test_poll()
             self._log_raw("System", "Session Started.")
-            self._log_raw("System", "Rumble params: I/T/R/G in [20,100], duration=3.0s to Xbox controller.")
+            ranges = self._canonical_param_ranges or {}
+            parts = []
+            for key in CANONICAL_PARAM_ORDER:
+                bounds = ranges.get(key)
+                if bounds is None:
+                    continue
+                low, high = bounds
+                parts.append(f"{key[0].upper()}[{float(low):g},{float(high):g}]")
+            if parts:
+                self._log_raw(
+                    "System",
+                    f"Rumble params: {', '.join(parts)}, duration=3.0s to Xbox controller.",
+                )
+            else:
+                self._log_raw("System", "Rumble params: duration=3.0s to Xbox controller.")
             self.btn_start.set_state("disabled")
             self.btn_reset.set_state("normal")
             if mode is SessionMode.TEST:
@@ -661,6 +793,7 @@ class AudioPreferenceStudyApp:
         self.session.reset()
         self.current_candidate = None
         self.selected_choice = None
+        self._reset_uncertainty_selection()
         self._draw_empty_wave()
         self.btn_start.set_state("normal")
         self.btn_reset.set_state("disabled")
@@ -668,11 +801,11 @@ class AudioPreferenceStudyApp:
         self.btn_play_b.set_state("disabled")
         self.btn_choose_a.set_state("disabled")
         self.btn_choose_b.set_state("disabled")
-        self.btn_submit.set_state("disabled")
-        self.iter_label.config(text="Iteration: 0 / 35")
+        self._update_submit_state()
+        self.iter_label.config(text=f"Iteration: 0 / {DEFAULT_MAX_ITERS}")
         self._log_raw("System", "Session Reset.")
         self._exported_data = False
-        self._last_drawn_test_iteration = -1
+        self._reset_map_cache()
         self._last_logged_test_record = 0
 
     def _prepare_new_candidate(self):
@@ -685,12 +818,13 @@ class AudioPreferenceStudyApp:
                 self._finish_session()
                 return
             self.current_audio_data = self.current_candidate.audio_data
-            self._wave_display = None
+            self._wave_display = 1 if 1 in self.current_audio_data else (2 if 2 in self.current_audio_data else None)
             self._draw_waveforms()
             self.selected_choice = None
+            self._reset_uncertainty_selection()
             self.btn_choose_a.config(text="Prefer A", bg=COLOR_PANEL, state="normal")
             self.btn_choose_b.config(text="Prefer B", bg=COLOR_PANEL, state="normal")
-            self.btn_submit.set_state("disabled")
+            self._update_submit_state()
             self.btn_play_a.set_state("normal")
             self.btn_play_b.set_state("normal")
             self._update_iteration_label()
@@ -717,22 +851,42 @@ class AudioPreferenceStudyApp:
         else:
             self.btn_choose_b.config(bg=COLOR_ACCENT, text="Preferred B ✓")
             self.btn_choose_a.config(bg=COLOR_PANEL, text="Prefer A")
-        
-        # Make sure Submit button is enabled
-        self.btn_submit.set_state("normal")
-        self.btn_submit.config(bg=COLOR_ACCENT) 
+
+        self._update_submit_state()
 
     def _on_unc_focus(self, level):
         """Called when gamepad focus moves to an uncertainty button."""
         self.unc_desc_label.config(text=UNCERTAINTY_DESCRIPTIONS.get(level, ""))
 
+    def _reset_uncertainty_selection(self) -> None:
+        self._uncertainty_selected = False
+        self.level_var.set(0)
+        self.unc_desc_label.config(text="Select level")
+        for btn in self.unc_btns:
+            btn.config(bg=COLOR_PANEL)
+            btn.label.configure(fg=COLOR_TEXT)
+
+    def _update_submit_state(self) -> None:
+        if self.selected_choice and self._uncertainty_selected:
+            self.btn_submit.set_state("normal")
+            self.btn_submit.config(bg=COLOR_ACCENT)
+        else:
+            self.btn_submit.set_state("disabled")
+            self.btn_submit.config(bg=COLOR_PANEL)
+
     def _set_level_selection(self, level):
         """Called when a level is actually selected (clicked/pressed)."""
         self.level_var.set(level)
+        self._uncertainty_selected = True
         self.unc_desc_label.config(text=UNCERTAINTY_DESCRIPTIONS.get(level, ""))
         for i, btn in enumerate(self.unc_btns):
-            if (i + 1) == level: btn.config(bg=COLOR_ACCENT, fg="#ffffff")
-            else: btn.config(bg=COLOR_PANEL, fg=COLOR_TEXT)
+            if (i + 1) == level:
+                btn.config(bg=COLOR_ACCENT)
+                btn.label.configure(fg="#ffffff")
+            else:
+                btn.config(bg=COLOR_PANEL)
+                btn.label.configure(fg=COLOR_TEXT)
+        self._update_submit_state()
 
     def _submit(self):
         if not self.selected_choice: return
@@ -765,6 +919,9 @@ class AudioPreferenceStudyApp:
                         f"Validation rounds started ({self.session.state.validation_rounds}).",
                     )
                     self._prepare_new_candidate()
+                    self.focus_manager.current_row = 2
+                    self.focus_manager.current_col = 0
+                    self.focus_manager._update_focus()
                 else:
                     self._finish_session()
             else:
@@ -778,6 +935,13 @@ class AudioPreferenceStudyApp:
 
     def _finish_session(self):
         self._log_raw("System", "Session Complete!")
+        if self._auto_close_on_complete:
+            self._show_recommendation_dialog(
+                title="User Study Complete",
+                header="User Study Complete. Thank you!",
+                on_close=self._close_after_recommendation,
+            )
+            return
         self._show_recommendation_dialog(
             title="User Study Complete",
             header="User Study Complete. Thank you!",
@@ -787,6 +951,10 @@ class AudioPreferenceStudyApp:
     def _finalize_user_session(self):
         self._persist_study_data(status="complete")
         self._reset()
+
+    def _close_after_recommendation(self):
+        self._persist_study_data(status="complete")
+        self._on_close()
 
     # --- Logging Helpers (Restored) ---
     def _log_raw(self, tag, msg):
@@ -820,6 +988,27 @@ class AudioPreferenceStudyApp:
             )
         except Exception:
             return "[I=?, T=?, R=?, G=?]"
+
+    def _slider_meta_from_phys(self, phys: Sequence[float]) -> Dict[str, Dict[str, float]]:
+        ranges = self._canonical_param_ranges or {}
+
+        def to_slider(key: str, value: float) -> float:
+            bounds = ranges.get(key, (20.0, 100.0))
+            low, high = float(bounds[0]), float(bounds[1])
+            if high == low:
+                return 20.0
+            norm = (float(value) - low) / (high - low)
+            norm = max(0.0, min(1.0, norm))
+            return 20.0 + norm * 80.0
+
+        return {
+            "sliders": {
+                "intensity": to_slider("intensity", phys[0]),
+                "texture": to_slider("texture", phys[1]),
+                "rhythm": to_slider("rhythm", phys[2]),
+                "grain": to_slider("grain", phys[3]),
+            }
+        }
 
     def _log_pair(self, mode_tag: str, level: int, choice: str, iter_label: Optional[str] = None) -> None:
         if not self.current_candidate: return
@@ -895,6 +1084,7 @@ class AudioPreferenceStudyApp:
         dialog.update_idletasks()
         dialog.wait_visibility()
         dialog.grab_set()
+        self._dialog_active = True
 
         frame = tk.Frame(dialog, bg=COLOR_PANEL, padx=24, pady=20)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -955,6 +1145,7 @@ class AudioPreferenceStudyApp:
                 dialog.grab_release()
             except Exception:
                 pass
+            self._dialog_active = False
             dialog.destroy()
             if on_close:
                 on_close()
@@ -971,6 +1162,147 @@ class AudioPreferenceStudyApp:
         )
         close_btn.pack(side=tk.LEFT, padx=6)
         dialog.protocol("WM_DELETE_WINDOW", handle_close)
+
+    def _reset_map_cache(self) -> None:
+        self._map_cache = {}
+        self._map_axes = None
+        self._map_artists = {}
+        self._map_last_draw_time = 0.0
+        self._last_drawn_test_iteration = -1
+
+    def _map_cache_key(self) -> Optional[Tuple[int, str, Tuple[Tuple[str, float, float], ...]]]:
+        param_ranges = self._canonical_param_ranges or {}
+        for key in CANONICAL_PARAM_ORDER:
+            if key not in param_ranges:
+                return None
+        ranges_key = tuple(
+            (key, float(param_ranges[key][0]), float(param_ranges[key][1]))
+            for key in CANONICAL_PARAM_ORDER
+        )
+        resolution = max(5, int(self.auto_test_config.plot.resolution))
+        return (resolution, self.session.state.gt_kind.value, ranges_key)
+
+    def _ensure_map_cache(self) -> bool:
+        if self.fig_map is None or self.canvas_map is None:
+            return False
+        key = self._map_cache_key()
+        if key is None:
+            return False
+        if self._map_cache.get("key") == key:
+            return True
+
+        resolution, _, _ = key
+        param_ranges = self._canonical_param_ranges or {}
+
+        def midpoint(name: str) -> float:
+            low, high = param_ranges[name]
+            return float((float(low) + float(high)) / 2.0)
+
+        fix_r = midpoint("rhythm")
+        fix_g = midpoint("grain")
+        xs_ab = np.linspace(*param_ranges["intensity"], resolution)
+        ys_ab = np.linspace(*param_ranges["texture"], resolution)
+        X_ab, Y_ab = np.meshgrid(xs_ab, ys_ab)
+        points_ab = np.column_stack(
+            [
+                X_ab.ravel(),
+                Y_ab.ravel(),
+                np.full(X_ab.size, fix_r),
+                np.full(X_ab.size, fix_g),
+            ]
+        )
+        Z_gt_ab = np.array([self.session.gt_value(p) for p in points_ab], dtype=float).reshape(
+            X_ab.shape
+        )
+
+        fix_i = midpoint("intensity")
+        fix_t = midpoint("texture")
+        xs_rg = np.linspace(*param_ranges["rhythm"], resolution)
+        ys_rg = np.linspace(*param_ranges["grain"], resolution)
+        X_rg, Y_rg = np.meshgrid(xs_rg, ys_rg)
+        points_rg = np.column_stack(
+            [
+                np.full(X_rg.size, fix_i),
+                np.full(X_rg.size, fix_t),
+                X_rg.ravel(),
+                Y_rg.ravel(),
+            ]
+        )
+        Z_gt_rg = np.array([self.session.gt_value(p) for p in points_rg], dtype=float).reshape(
+            X_rg.shape
+        )
+
+        self._map_cache = {
+            "key": key,
+            "X_ab": X_ab,
+            "Y_ab": Y_ab,
+            "X_rg": X_rg,
+            "Y_rg": Y_rg,
+            "points_ab": points_ab,
+            "points_rg": points_rg,
+            "Z_gt_ab": Z_gt_ab,
+            "Z_gt_rg": Z_gt_rg,
+            "fix_r": fix_r,
+            "fix_g": fix_g,
+            "fix_i": fix_i,
+            "fix_t": fix_t,
+        }
+
+        self.fig_map.clear()
+        ax11 = self.fig_map.add_subplot(221, projection="3d")
+        ax12 = self.fig_map.add_subplot(222, projection="3d")
+        ax21 = self.fig_map.add_subplot(223, projection="3d")
+        ax22 = self.fig_map.add_subplot(224, projection="3d")
+
+        ax11.plot_surface(X_ab, Y_ab, Z_gt_ab, cmap="coolwarm", alpha=0.9)
+        ax11.set_title(f"GT: Intensity×Texture @ (R={fix_r:.0f}, G={fix_g:.0f})")
+        ax11.set_xlabel("Intensity")
+        ax11.set_ylabel("Texture")
+        ax11.set_zlabel("GT")
+
+        ax12.set_title(f"GP: Intensity×Texture @ (R={fix_r:.0f}, G={fix_g:.0f})")
+        ax12.set_xlabel("Intensity")
+        ax12.set_ylabel("Texture")
+        ax12.set_zlabel("GP mean")
+
+        ax21.plot_surface(X_rg, Y_rg, Z_gt_rg, cmap="coolwarm", alpha=0.9)
+        ax21.set_title(f"GT: Rhythm×Grain @ (I={fix_i:.0f}, T={fix_t:.0f})")
+        ax21.set_xlabel("Rhythm")
+        ax21.set_ylabel("Grain")
+        ax21.set_zlabel("GT")
+
+        ax22.set_title(f"GP: Rhythm×Grain @ (I={fix_i:.0f}, T={fix_t:.0f})")
+        ax22.set_xlabel("Rhythm")
+        ax22.set_ylabel("Grain")
+        ax22.set_zlabel("GP mean")
+
+        self._map_axes = {"gt_ab": ax11, "gp_ab": ax12, "gt_rg": ax21, "gp_rg": ax22}
+        self._map_artists = {"gp_ab": None, "gp_rg": None, "markers": []}
+        self.fig_map.tight_layout()
+        return True
+
+    def _gp_mean_grid(self, points: np.ndarray, shape: Tuple[int, int]) -> np.ndarray:
+        if self.session.gp is None:
+            return np.zeros(shape, dtype=float)
+        norm = self.session.gp.normalize_parameters(points)
+        mu = self.session.gp.mean1pt(norm, eval=True)
+        return np.asarray(mu, dtype=float).reshape(shape)
+
+    def _maybe_draw_map(self, iteration: int, force: bool = False) -> None:
+        if self.session.state.mode is not SessionMode.TEST:
+            return
+        if not force and iteration == self._last_drawn_test_iteration:
+            return
+        update_every = max(1, int(self.auto_test_config.plot.update_every))
+        if not force and update_every > 1 and (iteration % update_every) != 0:
+            return
+        now = time.perf_counter()
+        min_interval = max(0.0, float(self.auto_test_config.plot.min_interval_s))
+        if not force and min_interval > 0.0 and (now - self._map_last_draw_time) < min_interval:
+            return
+        self._draw_map()
+        self._map_last_draw_time = now
+        self._last_drawn_test_iteration = iteration
 
     # --- Auto-test polling (TEST mode) ---
     def _schedule_test_poll(self) -> None:
@@ -998,22 +1330,8 @@ class AudioPreferenceStudyApp:
             while self._last_logged_test_record < len(records):
                 rec = records[self._last_logged_test_record]
                 p1_phys, p2_phys = rec.physical
-                meta1 = {
-                    "sliders": {
-                        "intensity": float(p1_phys[0]),
-                        "texture": float(p1_phys[1]),
-                        "rhythm": float(p1_phys[2]),
-                        "grain": float(p1_phys[3]),
-                    }
-                }
-                meta2 = {
-                    "sliders": {
-                        "intensity": float(p2_phys[0]),
-                        "texture": float(p2_phys[1]),
-                        "rhythm": float(p2_phys[2]),
-                        "grain": float(p2_phys[3]),
-                    }
-                }
+                meta1 = self._slider_meta_from_phys(p1_phys)
+                meta2 = self._slider_meta_from_phys(p2_phys)
                 extra_str = f" | EIG={float(rec.info_gain):.3f}, Dist={float(rec.query_distance):.3f}"
                 line = (
                     f"Iter {int(rec.iteration):02d} | "
@@ -1025,9 +1343,7 @@ class AudioPreferenceStudyApp:
         except Exception:
             pass
 
-        if iteration != self._last_drawn_test_iteration:
-            self._draw_map()
-            self._last_drawn_test_iteration = iteration
+        self._maybe_draw_map(iteration, force=not self.session.state.running)
 
         if not self.session.state.running:
             self.btn_start.set_state("normal")
@@ -1062,91 +1378,136 @@ class AudioPreferenceStudyApp:
             return
         if self.fig_map is None or self.canvas_map is None or self.session.gp is None:
             return
+        if not self._ensure_map_cache():
+            return
+
+        cache = self._map_cache
+        axes = self._map_axes
+        if axes is None:
+            return
+
+        X_ab = cache["X_ab"]
+        Y_ab = cache["Y_ab"]
+        X_rg = cache["X_rg"]
+        Y_rg = cache["Y_rg"]
+        Z_gp_ab = self._gp_mean_grid(cache["points_ab"], X_ab.shape)
+        Z_gp_rg = self._gp_mean_grid(cache["points_rg"], X_rg.shape)
+
+        old_gp_ab = self._map_artists.get("gp_ab")
+        if old_gp_ab is not None:
+            try:
+                old_gp_ab.remove()
+            except Exception:
+                pass
+        old_gp_rg = self._map_artists.get("gp_rg")
+        if old_gp_rg is not None:
+            try:
+                old_gp_rg.remove()
+            except Exception:
+                pass
+
+        self._map_artists["gp_ab"] = axes["gp_ab"].plot_surface(
+            X_ab, Y_ab, Z_gp_ab, cmap="viridis", alpha=0.9
+        )
+        self._map_artists["gp_rg"] = axes["gp_rg"].plot_surface(
+            X_rg, Y_rg, Z_gp_rg, cmap="viridis", alpha=0.9
+        )
+
+        for artist in self._map_artists.get("markers", []):
+            try:
+                artist.remove()
+            except Exception:
+                pass
+        markers = []
 
         gp = self.session.gp
-        param_ranges = self.session.audio.param_ranges
-
-        def midpoint(key: str) -> float:
-            low, high = param_ranges[key]
-            return float((float(low) + float(high)) / 2.0)
-
         def gp_mean(phys: Sequence[float]) -> float:
-            try:
-                mu = gp.mean1pt(gp.normalize_parameters(phys))
-                return float(mu[0] if isinstance(mu, (list, tuple, np.ndarray)) else mu)
-            except Exception:
-                return 0.0
-
-        self.fig_map.clear()
-        ax11 = self.fig_map.add_subplot(221, projection="3d")
-        ax12 = self.fig_map.add_subplot(222, projection="3d")
-        ax21 = self.fig_map.add_subplot(223, projection="3d")
-        ax22 = self.fig_map.add_subplot(224, projection="3d")
-
-        fix_r = midpoint("density")
-        fix_g = midpoint("gradient")
-        xs = np.linspace(*param_ranges["amplitude"], 31)
-        ys = np.linspace(*param_ranges["frequency"], 31)
-        X, Y = np.meshgrid(xs, ys)
-        Z_gt = np.zeros_like(X)
-        Z_gp = np.zeros_like(X)
-        for i in range(X.shape[0]):
-            for j in range(X.shape[1]):
-                phys = [X[i, j], Y[i, j], fix_r, fix_g]
-                Z_gt[i, j] = self.session.gt_value(phys)
-                Z_gp[i, j] = gp_mean(phys)
-
-        ax11.plot_surface(X, Y, Z_gt, cmap="coolwarm", alpha=0.9)
-        ax11.set_title(f"GT: Intensity×Texture @ (R={fix_r:.0f}, G={fix_g:.0f})")
-        ax11.set_xlabel("Intensity")
-        ax11.set_ylabel("Texture")
-        ax11.set_zlabel("GT")
-        ax12.plot_surface(X, Y, Z_gp, cmap="viridis", alpha=0.9)
-        ax12.set_title(f"GP: Intensity×Texture @ (R={fix_r:.0f}, G={fix_g:.0f})")
-        ax12.set_xlabel("Intensity")
-        ax12.set_ylabel("Texture")
-        ax12.set_zlabel("GP mean")
+            mu = gp.mean1pt(gp.normalize_parameters(phys))
+            return float(mu[0] if isinstance(mu, (list, tuple, np.ndarray)) else mu)
 
         ideal = np.asarray(self.session.ideal_phys, dtype=float)
-        ax11.scatter(ideal[0], ideal[1], self.session.gt_value([ideal[0], ideal[1], fix_r, fix_g]), marker="*", s=120)
-        ax12.scatter(ideal[0], ideal[1], gp_mean([ideal[0], ideal[1], fix_r, fix_g]), marker="*", s=120)
+        fix_r = cache["fix_r"]
+        fix_g = cache["fix_g"]
+        fix_i = cache["fix_i"]
+        fix_t = cache["fix_t"]
+
+        markers.append(
+            axes["gt_ab"].scatter(
+                ideal[0],
+                ideal[1],
+                self.session.gt_value([ideal[0], ideal[1], fix_r, fix_g]),
+                marker="*",
+                s=120,
+            )
+        )
+        markers.append(
+            axes["gp_ab"].scatter(
+                ideal[0],
+                ideal[1],
+                gp_mean([ideal[0], ideal[1], fix_r, fix_g]),
+                marker="*",
+                s=120,
+            )
+        )
+        markers.append(
+            axes["gt_rg"].scatter(
+                ideal[2],
+                ideal[3],
+                self.session.gt_value([fix_i, fix_t, ideal[2], ideal[3]]),
+                marker="*",
+                s=120,
+            )
+        )
+        markers.append(
+            axes["gp_rg"].scatter(
+                ideal[2],
+                ideal[3],
+                gp_mean([fix_i, fix_t, ideal[2], ideal[3]]),
+                marker="*",
+                s=120,
+            )
+        )
+
         if self.session.rec_best.parameters is not None:
             rec = np.asarray(self.session.rec_best.parameters, dtype=float)
-            ax11.scatter(rec[0], rec[1], self.session.gt_value([rec[0], rec[1], fix_r, fix_g]), marker="x", s=80)
-            ax12.scatter(rec[0], rec[1], gp_mean([rec[0], rec[1], fix_r, fix_g]), marker="x", s=80)
+            markers.append(
+                axes["gt_ab"].scatter(
+                    rec[0],
+                    rec[1],
+                    self.session.gt_value([rec[0], rec[1], fix_r, fix_g]),
+                    marker="x",
+                    s=80,
+                )
+            )
+            markers.append(
+                axes["gp_ab"].scatter(
+                    rec[0],
+                    rec[1],
+                    gp_mean([rec[0], rec[1], fix_r, fix_g]),
+                    marker="x",
+                    s=80,
+                )
+            )
+            markers.append(
+                axes["gt_rg"].scatter(
+                    rec[2],
+                    rec[3],
+                    self.session.gt_value([fix_i, fix_t, rec[2], rec[3]]),
+                    marker="x",
+                    s=80,
+                )
+            )
+            markers.append(
+                axes["gp_rg"].scatter(
+                    rec[2],
+                    rec[3],
+                    gp_mean([fix_i, fix_t, rec[2], rec[3]]),
+                    marker="x",
+                    s=80,
+                )
+            )
 
-        fix_i = midpoint("amplitude")
-        fix_t = midpoint("frequency")
-        xs = np.linspace(*param_ranges["density"], 31)
-        ys = np.linspace(*param_ranges["gradient"], 31)
-        X, Y = np.meshgrid(xs, ys)
-        Z_gt = np.zeros_like(X)
-        Z_gp = np.zeros_like(X)
-        for i in range(X.shape[0]):
-            for j in range(X.shape[1]):
-                phys = [fix_i, fix_t, X[i, j], Y[i, j]]
-                Z_gt[i, j] = self.session.gt_value(phys)
-                Z_gp[i, j] = gp_mean(phys)
-
-        ax21.plot_surface(X, Y, Z_gt, cmap="coolwarm", alpha=0.9)
-        ax21.set_title(f"GT: Rhythm×Grain @ (I={fix_i:.0f}, T={fix_t:.0f})")
-        ax21.set_xlabel("Rhythm")
-        ax21.set_ylabel("Grain")
-        ax21.set_zlabel("GT")
-        ax22.plot_surface(X, Y, Z_gp, cmap="viridis", alpha=0.9)
-        ax22.set_title(f"GP: Rhythm×Grain @ (I={fix_i:.0f}, T={fix_t:.0f})")
-        ax22.set_xlabel("Rhythm")
-        ax22.set_ylabel("Grain")
-        ax22.set_zlabel("GP mean")
-
-        ax21.scatter(ideal[2], ideal[3], self.session.gt_value([fix_i, fix_t, ideal[2], ideal[3]]), marker="*", s=120)
-        ax22.scatter(ideal[2], ideal[3], gp_mean([fix_i, fix_t, ideal[2], ideal[3]]), marker="*", s=120)
-        if self.session.rec_best.parameters is not None:
-            rec = np.asarray(self.session.rec_best.parameters, dtype=float)
-            ax21.scatter(rec[2], rec[3], self.session.gt_value([fix_i, fix_t, rec[2], rec[3]]), marker="x", s=80)
-            ax22.scatter(rec[2], rec[3], gp_mean([fix_i, fix_t, rec[2], rec[3]]), marker="x", s=80)
-
-        self.fig_map.tight_layout()
+        self._map_artists["markers"] = markers
         self.canvas_map.draw_idle()
 
     def _segments_to_plot(self, segments, total_duration: float):
@@ -1231,7 +1592,9 @@ class AudioPreferenceStudyApp:
         try:
             while not self.gp_state_q.empty():
                 evt_type, data = self.gp_state_q.get_nowait()
-                
+                if self._dialog_active and evt_type in ("BTN_DOWN", "NAV"):
+                    continue
+
                 if evt_type == "STATUS":
                     self.status_var.set(f"Gamepad: {data}")
                     
@@ -1259,12 +1622,24 @@ class AudioPreferenceStudyApp:
         finally:
             if not self._closing:
                 try:
-                    self.root.after(20, self._poll_gamepad_queue)
+                    self._gamepad_poll_job = self.root.after(20, self._poll_gamepad_queue)
                 except Exception:
-                    pass
+                    self._gamepad_poll_job = None
 
     def _on_close(self):
         self._closing = True
+        if self._pygame_poll_job is not None:
+            try:
+                self.root.after_cancel(self._pygame_poll_job)
+            except Exception:
+                pass
+            self._pygame_poll_job = None
+        if self._gamepad_poll_job is not None:
+            try:
+                self.root.after_cancel(self._gamepad_poll_job)
+            except Exception:
+                pass
+            self._gamepad_poll_job = None
         try:
             self._cancel_test_poll()
         except Exception:
@@ -1305,20 +1680,44 @@ class AudioPreferenceStudyApp:
             pass
         self.root.destroy()
 
-def user_main() -> int:
+def user_main(auto_close_on_complete: bool = False) -> int:
     try:
         root = tk.Tk()
-        app = AudioPreferenceStudyApp(root, fixed_mode=SessionMode.USER)
+        app = AudioPreferenceStudyApp(
+            root,
+            fixed_mode=SessionMode.USER,
+            auto_close_on_complete=auto_close_on_complete,
+        )
         root.mainloop()
     except Exception as exc:
         print(f"Failed to launch: {exc}")
         return 1
     return 0
 
-def test_main() -> int:
+def test_main(
+    max_iterations: int = DEFAULT_MAX_ITERS,
+    gt_label: Optional[str] = None,
+    seed: Optional[int] = None,
+    param_ranges: Optional[Dict[str, Tuple[float, float]]] = None,
+    plot_resolution: int = 31,
+    plot_update_every: int = 1,
+    plot_min_interval_s: float = 0.0,
+) -> int:
     try:
         root = tk.Tk()
-        app = AudioPreferenceStudyApp(root, fixed_mode=SessionMode.TEST)
+        plot_cfg = AutoTestPlotConfig(
+            resolution=plot_resolution,
+            update_every=plot_update_every,
+            min_interval_s=plot_min_interval_s,
+        )
+        cfg = AutoTestConfig(
+            max_iterations=max_iterations,
+            gt_label=gt_label or GroundTruthKind.GAUSSIAN_CENTER.value,
+            seed=seed,
+            param_ranges=param_ranges,
+            plot=plot_cfg,
+        )
+        app = AudioPreferenceStudyApp(root, fixed_mode=SessionMode.TEST, auto_test_config=cfg)
         root.mainloop()
     except Exception as exc:
         print(f"Failed to launch auto test UI: {exc}")

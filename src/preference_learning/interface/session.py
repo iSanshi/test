@@ -5,6 +5,7 @@ Session/business logic for the audio preference learning application.
 from __future__ import annotations
 
 import json
+import secrets
 import threading
 import time
 from dataclasses import dataclass
@@ -28,8 +29,8 @@ from ..evaluation import (
 
 LEVEL_TO_WEIGHT = {1: 0.1, 2: 0.3, 3: 0.5, 4: 0.8, 5: 1.0}
 DIFF_THRESHOLDS = [0.01, 0.05, 0.10, 0.20]
-DEFAULT_SESSION_SEED = 123
-DEFAULT_VALIDATION_ROUNDS = 3
+DEFAULT_SESSION_SEED = None
+DEFAULT_VALIDATION_ROUNDS = 5
 DEFAULT_GT_RANDOM_SAMPLES = 10000
 DEFAULT_GT_TOP_K = 20
 DEFAULT_VALIDATION_TOP_K = 20
@@ -102,6 +103,17 @@ class TestQueryRecord:
 
 
 @dataclass
+class UserQueryRecord:
+    iteration: int
+    normalized: Tuple[np.ndarray, np.ndarray]
+    physical: Tuple[np.ndarray, np.ndarray]
+    choice: str
+    level: int
+    info_gain: float
+    query_distance: float
+
+
+@dataclass
 class Recommendation:
     parameters: Optional[np.ndarray] = None
     mean_value: Optional[float] = None
@@ -113,6 +125,9 @@ class ValidationRecord:
     round_index: int
     choice: str
     level: int
+    normalized: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    physical: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    query_distance: Optional[float] = None
     pair_type: Optional[str] = None
     predicted_margin: Optional[float] = None
     model_winner: Optional[str] = None
@@ -162,6 +177,7 @@ class PreferenceSession:
         self.posterior_rec_mean_history: List[float] = []
         self.gt_regret_history: List[float] = []
         self.gt_spearman_history: List[float] = []
+        self.user_query_history: List[UserQueryRecord] = []
         self.test_query_history: List[TestQueryRecord] = []
         self.validation_records: List[ValidationRecord] = []
         self.validation_recommended: Optional[np.ndarray] = None
@@ -211,6 +227,7 @@ class PreferenceSession:
         self.posterior_rec_mean_history.clear()
         self.gt_regret_history.clear()
         self.gt_spearman_history.clear()
+        self.user_query_history.clear()
         self.test_query_history.clear()
         self.validation_records.clear()
         self.validation_recommended = None
@@ -232,7 +249,12 @@ class PreferenceSession:
         self.state.validation_index = 0
 
     def _set_seed(self, seed: Optional[int]) -> None:
-        chosen = DEFAULT_SESSION_SEED if seed is None else int(seed)
+        if seed is None:
+            chosen = DEFAULT_SESSION_SEED
+            if chosen is None:
+                chosen = int(secrets.randbits(32))
+        else:
+            chosen = int(seed)
         self.state.seed = chosen
         np.random.seed(chosen)
 
@@ -254,7 +276,16 @@ class PreferenceSession:
         self.state.validation_index = 0
 
         initial_point = [0.5, 0.5, 0.5, 0.5]
-        self.gp = AudioPreferenceGaussianProcess(initial_point=initial_point, theta=0.5, noise_level=0.1)
+        parameter_bounds = {
+            key: (float(bounds[0]), float(bounds[1]))
+            for key, bounds in self.audio.param_ranges.items()
+        }
+        self.gp = AudioPreferenceGaussianProcess(
+            initial_point=initial_point,
+            theta=2.5,
+            noise_level=0.1,
+            parameter_bounds=parameter_bounds,
+        )
 
         center = np.array(initial_point)
         self.pref_dict = {tuple(center): LEVEL_TO_WEIGHT[3]}
@@ -309,6 +340,7 @@ class PreferenceSession:
             return
         self.state.phase = SessionPhase.VALIDATION
         self.state.validation_index = 0
+        self.state.validation_rounds = max(1, int(requested_rounds))
         self.validation_records.clear()
         self.validation_pairs.clear()
 
@@ -317,8 +349,6 @@ class PreferenceSession:
         if self.rec_best.parameters is None:
             return
         self.validation_recommended = np.asarray(self.rec_best.parameters, dtype=float)
-
-        self.state.validation_rounds = 5
 
         bounds = self._physical_bounds()
         bounds_arr = np.asarray(bounds, dtype=float)
@@ -506,6 +536,10 @@ class PreferenceSession:
         )
 
         self.validation_pairs = [round1, round2, round3, round4, round5]
+        if self.state.validation_rounds < len(self.validation_pairs):
+            self.validation_pairs = self.validation_pairs[: self.state.validation_rounds]
+        elif self.state.validation_rounds > len(self.validation_pairs):
+            self.state.validation_rounds = len(self.validation_pairs)
         self.validation_competitor = np.asarray(worst, dtype=float)
         self.validation_config = {
             "strategy": "smcc",
@@ -624,6 +658,10 @@ class PreferenceSession:
         y = 1 if choice_label == "A" else -1
         p1_norm, p2_norm = self.current_candidates.normalized
         p1_phys, p2_phys = self.current_candidates.physical
+        p1_norm = np.asarray(p1_norm, dtype=float)
+        p2_norm = np.asarray(p2_norm, dtype=float)
+        p1_phys = np.asarray(p1_phys, dtype=float)
+        p2_phys = np.asarray(p2_phys, dtype=float)
 
         for key in (tuple(p1_norm), tuple(p2_norm)):
             self.pref_dict[key] = self.pref_dict.get(key, 0.0) + LEVEL_TO_WEIGHT[level]
@@ -643,6 +681,17 @@ class PreferenceSession:
         self.query_distance_history.append(self.current_candidates.query_distance)
 
         self.state.current_iteration += 1
+        self.user_query_history.append(
+            UserQueryRecord(
+                iteration=self.state.current_iteration,
+                normalized=(p1_norm.copy(), p2_norm.copy()),
+                physical=(p1_phys.copy(), p2_phys.copy()),
+                choice=choice_label,
+                level=level,
+                info_gain=float(self.current_candidates.info_gain),
+                query_distance=float(self.current_candidates.query_distance),
+            )
+        )
         self._update_recommendation()
 
     def record_validation_choice(self, choice_label: str, level: int) -> None:
@@ -658,10 +707,33 @@ class PreferenceSession:
         is_aligned = None
         if model_winner in ("A", "B"):
             is_aligned = choice_label == model_winner
+        p1_norm = p2_norm = None
+        p1_phys = p2_phys = None
+        query_distance = None
+        if self.current_candidates is not None:
+            cand_norm = self.current_candidates.normalized
+            cand_phys = self.current_candidates.physical
+            p1_norm = np.asarray(cand_norm[0], dtype=float)
+            p2_norm = np.asarray(cand_norm[1], dtype=float)
+            p1_phys = np.asarray(cand_phys[0], dtype=float)
+            p2_phys = np.asarray(cand_phys[1], dtype=float)
+            query_distance = float(self.current_candidates.query_distance)
+        elif pair_meta is not None:
+            if "A" in pair_meta and "B" in pair_meta:
+                p1_phys = np.asarray(pair_meta["A"], dtype=float)
+                p2_phys = np.asarray(pair_meta["B"], dtype=float)
+                if self.gp is not None:
+                    p1_norm = self.gp.normalize_parameters(p1_phys)
+                    p2_norm = self.gp.normalize_parameters(p2_phys)
+                    query_distance = float(np.linalg.norm(p1_norm - p2_norm))
+
         record = ValidationRecord(
             round_index=self.state.validation_index + 1,
             choice=choice_label,
             level=level,
+            normalized=(p1_norm.copy(), p2_norm.copy()) if p1_norm is not None else None,
+            physical=(p1_phys.copy(), p2_phys.copy()) if p1_phys is not None else None,
+            query_distance=query_distance,
             pair_type=pair_type,
             predicted_margin=predicted_margin,
             model_winner=model_winner,
@@ -966,6 +1038,94 @@ class PreferenceSession:
                 gt_eval_fn=self._gt_value,
             )
 
+        def to_float_list(arr: Optional[np.ndarray]) -> Optional[List[float]]:
+            if arr is None:
+                return None
+            return list(map(float, np.asarray(arr, dtype=float).tolist()))
+
+        training_queries = []
+        for rec in self.user_query_history:
+            p1_norm, p2_norm = rec.normalized
+            p1_phys, p2_phys = rec.physical
+            training_queries.append(
+                {
+                    "iteration": int(rec.iteration),
+                    "A": to_float_list(p1_phys),
+                    "B": to_float_list(p2_phys),
+                    "A_norm": to_float_list(p1_norm),
+                    "B_norm": to_float_list(p2_norm),
+                    "choice": rec.choice,
+                    "level": int(rec.level),
+                    "info_gain": float(rec.info_gain),
+                    "query_distance": float(rec.query_distance),
+                }
+            )
+
+        validation_queries = []
+        for idx, rec in enumerate(self.validation_records):
+            p1_norm, p2_norm = None, None
+            p1_phys, p2_phys = None, None
+            if rec.normalized is not None:
+                p1_norm, p2_norm = rec.normalized
+            if rec.physical is not None:
+                p1_phys, p2_phys = rec.physical
+            if (p1_phys is None or p2_phys is None) and idx < len(self.validation_pairs):
+                pair_meta = self.validation_pairs[idx]
+                if "A" in pair_meta and "B" in pair_meta:
+                    p1_phys = np.asarray(pair_meta["A"], dtype=float)
+                    p2_phys = np.asarray(pair_meta["B"], dtype=float)
+            if (p1_norm is None or p2_norm is None) and self.gp is not None and p1_phys is not None:
+                p1_norm = self.gp.normalize_parameters(p1_phys)
+                p2_norm = self.gp.normalize_parameters(p2_phys)
+            query_distance = rec.query_distance
+            if query_distance is None and p1_norm is not None and p2_norm is not None:
+                query_distance = float(np.linalg.norm(np.asarray(p1_norm) - np.asarray(p2_norm)))
+            validation_queries.append(
+                {
+                    "round": int(rec.round_index),
+                    "A": to_float_list(p1_phys),
+                    "B": to_float_list(p2_phys),
+                    "A_norm": to_float_list(p1_norm),
+                    "B_norm": to_float_list(p2_norm),
+                    "choice": rec.choice,
+                    "level": int(rec.level),
+                    "pair_type": rec.pair_type,
+                    "predicted_margin": (
+                        float(rec.predicted_margin) if rec.predicted_margin is not None else None
+                    ),
+                    "model_winner": rec.model_winner,
+                    "is_aligned": rec.is_aligned,
+                    "query_distance": query_distance,
+                }
+            )
+
+        test_queries = []
+        for rec in self.test_query_history:
+            p1_phys, p2_phys = rec.physical
+            p1_norm = p2_norm = None
+            if self.gp is not None:
+                p1_norm = self.gp.normalize_parameters(p1_phys)
+                p2_norm = self.gp.normalize_parameters(p2_phys)
+            test_queries.append(
+                {
+                    "iteration": int(rec.iteration),
+                    "A": to_float_list(p1_phys),
+                    "B": to_float_list(p2_phys),
+                    "A_norm": to_float_list(p1_norm),
+                    "B_norm": to_float_list(p2_norm),
+                    "choice": rec.choice,
+                    "level": int(rec.level),
+                    "info_gain": float(rec.info_gain),
+                    "query_distance": float(rec.query_distance),
+                }
+            )
+
+        query_pairs = {
+            "training": training_queries,
+            "validation": validation_queries,
+            "test": test_queries,
+        }
+
         metrics = {
             "info_gain": list(map(float, self.info_gain_history)),
             "posterior_rec_mean": list(map(float, self.posterior_rec_mean_history)),
@@ -974,11 +1134,31 @@ class PreferenceSession:
             "gt_spearman_history": list(map(float, self.gt_spearman_history)),
         }
 
+        param_ranges: Dict[str, List[float]] = {}
+        for canonical, legacy in PARAMETER_NAME_MAP.items():
+            bounds = self.audio.param_ranges.get(legacy)
+            if bounds is None:
+                bounds = self.audio.param_ranges.get(canonical)
+            if bounds is None:
+                continue
+            param_ranges[canonical] = [float(bounds[0]), float(bounds[1])]
+        for key, bounds in self.audio.param_ranges.items():
+            if key in PARAMETER_NAME_MAP.values():
+                continue
+            if key in param_ranges:
+                continue
+            param_ranges[key] = [float(bounds[0]), float(bounds[1])]
+
         metadata = {
             "mode": self.state.mode.value,
             "n_queries_planned": int(self.state.max_iterations),
             "n_queries_completed": int(self.state.current_iteration),
             "status": status,
+            "seed": int(self.state.seed) if self.state.seed is not None else None,
+            "gt_kind": self.state.gt_kind.value,
+            "phase": self.state.phase.value,
+            "validation_rounds": int(self.state.validation_rounds),
+            "param_ranges": param_ranges,
         }
 
         snapshot: Dict[str, object] = {
@@ -995,6 +1175,7 @@ class PreferenceSession:
             ],
             "final_recommendation": rec_params,
             "final_summary": final_summary,
+            "query_pairs": query_pairs,
             "metrics": metrics,
             "metadata": metadata,
         }
