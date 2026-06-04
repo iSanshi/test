@@ -1,110 +1,152 @@
-# Haptic Preference Learning (HPL)
+# ContactExplorer LEAP Singulation on Genesis
 
-[中文版](README_zh-CN.md)
+This is a migration attempt for the ContactExplorer `leap_singulation` task from
+Isaac Gym to Genesis World.
 
-This repo provides a **preference-based haptic personalization** framework that learns a user's latent utility from **binary A/B choices**. We use a **Gaussian Process (GP) preference model** to capture smoothness and uncertainty over the stimulus space, and an **active query policy** that maximizes **expected information gain** to pick the next comparison. Users can report **response uncertainty**, which is used as per-comparison weights to down-weight ambiguous judgments. By emphasizing **relative** (not absolute) evaluations, the system reduces rating fatigue and drift and avoids forcing tactile sensations onto a numeric scale.
+It is not a byte-for-byte port of the Isaac Gym task. The original task is tightly
+coupled to Isaac Gym/PhysX tensor APIs, so the environment is reimplemented with
+Genesis primitives and Genesis batched simulation.
 
-**Highlights**
-- GP preference learning over haptic stimuli (uncertainty-aware, smoothness prior)
-- Information-gain active querying for sample-efficient searches
-- Per-comparison **uncertainty weighting** to handle ambiguous answers
-- End-to-end UI for user study, auto-test, and favorite-signal capture
+## What Is Migrated
 
-![UI Demo](image1.png)
-![UI Demo](image2.png)
-## Quick Start
-1. Clone the repo:
-   ```bash
-   git clone https://github.com/iSanshi/haptic-preference-learning.git
-   cd haptic-preference-learning
-   ```
-2. (Optional) create a virtual environment:
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # Windows: .venv\Scripts\activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Launch:
-   ```bash
-   python run_study.py         # user study + favorite signal capture
-   python run_user_study_ui.py # user study only
-   python run_auto_test_ui.py  # automated test workflow
-   python xbox_control.py      # standalone favorite capture
-   ```
-5. Press **Start Session** in the UI. In user mode, play A/B (X/Y), choose A/B, and rate uncertainty (1-5). In auto-test mode, the system simulates preferences via a ground-truth function.
-6. When a session completes, results are exported to `data/YYYYMMDD_<index>/session.json` and `log.txt`.
+- Genesis scene with:
+  - xArm6 + LEAP hand URDF from ContactExplorer assets
+  - table
+  - 5 singulation boxes
+  - target marker
+- Gym-like RL environment:
+  - `reset()`
+  - `step(actions)`
+  - observation TensorDict for RSL-RL
+  - reward, done, extras
+- Genesis contact integration:
+  - reads `scene.rigid_solver.collider.get_contacts()`
+  - logs fingertip-target, target-table, target-neighbor, and detach/contact flags
+  - adds contact features to policy observations
+- Genesis IK integration:
+  - first 6 action dimensions move and rotate the xArm end-effector target through Genesis IK
+  - remaining 16 action dimensions control LEAP finger joints
+- Episode termination:
+  - configurable near-goal `success_steps`
+  - resets on target fall
+  - resets on non-target arm contact while allowing normal hand/table contact
+- Domain randomization and disturbances:
+  - per-env object friction ratio
+  - per-env object mass shift
+  - per-env object COM shift
+  - per-env robot PD gain randomization
+  - random external force/torque wrench on the target object
+- Contact coverage exploration:
+  - rotates the canonical cube point cloud and normals by the target object's
+    current pose before computing state features and surface distances
+  - maps fingertip-target contact positions back into the target local frame
+    before nearest-surface assignment
+  - uses a state-conditioned counter shaped like the original task:
+    `state_id x fingertip/keypoint x surface_cluster`
+  - uses farthest-point sampling for state points and cluster initialization
+  - supports normal-aware clustering with canonical cube normals
+  - supports backface and palm-inward contact masks
+  - supports inverse/gaussian/exponential potential kernels and
+    exponential/linear/sqrt/logarithmic novelty decay modes
+  - supports a Genesis-native learned hash state bank:
+    surface point-cloud features -> hash autoencoder -> SimHash state id
+  - supports a `predefined` progress-bin state bank as a debugging fallback
+  - uses running-max shaping for potential and contact novelty rewards
+  - logs `contact_count`, `cluster_novelty_reward`, `avg_potential`,
+    `stateid_entropy`, `hash_recon_loss`, `hash_binary_reg`, `state_coverage`,
+    and per-keypoint contact fields
+- Random-action viewer
+- PPO training entry using Genesis' RSL-RL style
+- ContactExplorer-style PPO defaults for this LEAP singulation port:
+  - actor/critic MLP hidden sizes `[512, 256, 128]`
+  - observation normalization enabled
+  - value running mean/std normalization enabled and saved in checkpoints
+  - PPO clip range `0.1`, entropy coefficient `0`, rollout steps `12`,
+    learning epochs `2`
+  - environment reward scale `0.01`
+  - `success_steps=60`
+- ContactExplorer-style PPO-side intrinsic curiosity:
+  - prediction error
+  - RND
+  - disagreement ensemble
+  - neural hash
+  - stores `next_curiosity_states`, adds intrinsic reward during rollout, and
+    trains the curiosity model during PPO updates
+- Checkpoint evaluation viewer
 
-## Outputs
-- `data/YYYYMMDD_<index>/session.json` + `log.txt`: preference history, GP metrics, and final summary.
-- `data/YYYYMMDD_<index>/favorite_signal.json`: saved by `run_study.py` after you record the favorite signal.
-- `data/bestparam/###.json`: saved when running `xbox_control.py` standalone.
+## What Is Not Yet Equivalent To The Paper
 
-## Configuration
-- User-study iterations: `DEFAULT_MAX_ITERS` in `src/preference_learning/interface/ui_study.py`.
-- Auto-test iterations: `--iters` in `run_auto_test_ui.py` (default 40).
-- Ground-truth model: `--gt` (`center|offset|bimodal|ridge`).
-- Parameter ranges: `--ranges` accepts JSON with keys `intensity|texture|rhythm|grain` (legacy keys are accepted too).
+- ContactExplorer's exact Isaac Gym net-contact-force tensor semantics are not replicated.
+- The original `CuriosityRewardManager` is not imported byte-for-byte because it
+  depends on Isaac Gym project modules, but its learned hash state-bank behavior
+  and the CCGE surface/normal/state-counter logic are ported as pure PyTorch
+  Genesis-native modules.
+- ContactExplorer's PPO-side intrinsic curiosity is implemented as a local
+  `CuriosityPPO` wrapper around RSL-RL PPO. It matches the algorithmic data flow,
+  but it is not a byte-for-byte copy of the original Isaac Gym PPO runner.
+- Domain randomization for scale and some Isaac-specific random wrench details is
+  not byte-for-byte ported, but Genesis mass/COM/friction/PD/wrench randomization
+  is implemented.
+- The dense reward keeps the core singulation signals and CCGE reward scalings,
+  but Isaac-specific diagnostics/gates that depend on Isaac tensor semantics are
+  still not byte-identical.
+- Physics/contact behavior will not match Isaac Gym PhysX exactly.
+
+This should be treated as a Genesis backend prototype, not a paper-reproduction
+replacement.
 
 ## Requirements
-- Python 3.8+ with Tkinter.
-- Audio output via PortAudio (`sounddevice`).
-- Optional Xbox controller via `pygame`.
 
-## Session Output (session.json)
-The export keeps legacy fields and adds structured summaries:
-- `final_summary`: GP posterior-mean recommendation, search method, bounds, posterior uncertainty, and (mode-dependent) validation/test metrics.
-- `metrics`: per-iteration arrays such as `info_gain` (aligned to preferences) and `posterior_best_mean`.
-- `metadata`: session mode, planned/completed queries, and completion status.
-- Additional test/validation fields: `gt_best_val`, `gt_best_params`, `gt_rec_val`, `eval_set_best_val`, `gt_search_config`, `validation_config`, `gt_regret_history`, `gt_spearman_history`.
+Genesis World must be installed or runnable from `/mnt/p5/genesis-world-v1.0.0`.
+This migration has a local virtual environment at:
 
-Example snippet:
-```json
-{
-  "final_summary": {
-    "recommended_params": [61.2, 58.7, 64.0, 55.9],
-    "recommended_score": 0.84,
-    "method": "lbfgsb",
-    "bounds": {"intensity": [20.0, 100.0], "texture": [20.0, 100.0], "rhythm": [20.0, 100.0], "grain": [20.0, 100.0]},
-    "posterior_uncertainty": {"avg_pred_var": 0.12, "max_pred_var": 0.41},
-    "validation": {"rounds": 3, "win_rate": 0.67, "records": [{"round": 1, "choice": "A", "level": 4}]},
-    "test_metrics": {"pearson": 0.71, "spearman": 0.68, "regret": 0.09, "distance_to_optimum": 6.4}
-  },
-  "metrics": {
-    "info_gain": [0.21, 0.19, 0.17],
-    "posterior_best_mean": [0.41, 0.53, 0.61]
-  },
-  "metadata": {"mode": "User Study", "n_queries_planned": 40, "n_queries_completed": 40, "status": "complete"}
-}
+```text
+/mnt/p5/contactexplorer_genesis/.venv
 ```
 
-## Project Layout
+It was created with GPU PyTorch and the local Genesis source:
+
+```bash
+python3.12 -m venv /mnt/p5/contactexplorer_genesis/.venv
+/mnt/p5/contactexplorer_genesis/.venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu126
+/mnt/p5/contactexplorer_genesis/.venv/bin/pip install -e /mnt/p5/genesis-world-v1.0.0 rsl-rl-lib tensordict
 ```
-.
-├── README.md
-├── README_zh-CN.md
-├── requirements.txt
-├── run_study.py
-├── run_user_study_ui.py
-├── run_auto_test_ui.py
-├── xbox_control.py
-├── data/
-└── src
-    └── preference_learning
-        ├── __init__.py
-        ├── audio
-        │   ├── generator.py
-        │   └── signal.py
-        ├── gp
-        │   ├── audio_gp.py
-        │   ├── gaussian_process.py
-        │   └── math_utils.py
-        ├── evaluation.py
-        └── interface
-            ├── __init__.py
-            ├── session.py
-            ├── ui_study.py
-            └── logo/
+
+## Commands
+
+From this directory:
+
+```bash
+./scripts/viewer.sh --backend gpu --num-envs 1 --random-actions
+./scripts/viewer.sh --backend gpu --num-envs 1 --random-actions --headless --steps 2
+
+./scripts/train.sh --backend gpu --num-envs 256 --max-iterations 1000 --save-interval 100
+./scripts/train_leap_singulation_learn.sh
+./scripts/train.sh --backend gpu --num-envs 256 --max-iterations 1000 --wrench-prob 0.02 --force-scale 0.6 --torque-scale 0.02
+./scripts/train.sh --backend gpu --num-envs 256 --max-iterations 1000 --no-randomize-dynamics
+./scripts/train.sh --backend gpu --num-envs 256 --max-iterations 1000 --state-type hash
+./scripts/train.sh --backend gpu --num-envs 256 --max-iterations 1000 --state-type predefined
+./scripts/train.sh --backend gpu --num-envs 256 --max-iterations 1000 --use-ppo-curiosity --curiosity-model-type prediction_error --intrinsic-reward-scale 1.0
+./scripts/train.sh --backend gpu --num-envs 256 --max-iterations 1000 --use-ppo-curiosity --curiosity-model-type neural_hash --curiosity-state-type state_feature
+./scripts/eval.sh --backend gpu --checkpoint logs/leap_singulation_genesis/model_1000.pt --num-envs 1 --viewer
+```
+
+If you already have Genesis installed in another Python environment:
+
+```bash
+PYTHONPATH=/mnt/p5/contactexplorer_genesis python viewer.py --random-actions
+```
+
+## Asset Path
+
+By default the code reads assets from:
+
+```text
+/mnt/p5/ContactExplorer/repo/assets
+```
+
+Override with:
+
+```bash
+export CONTACTEXPLORER_ASSETS=/path/to/ContactExplorer/repo/assets
 ```
