@@ -1,0 +1,6 @@
+style_id,style_name,success_rate,final_goal_dist_mean,selected_style_contact_rate,palm_contact_rate,fingertip_contact_rate,mcp_contact_rate,pip_dip_contact_rate,thumb_contact_rate
+0,fingertip,0.0,0.29179524381955463,0.0,0.0,0.0,0.0,0.0,0.0
+1,palm,0.0,0.27192704876263935,0.0,0.0,0.0,0.0,0.0,0.0
+2,mcp,0.0,0.2964053253332774,0.0,0.0,0.0,0.0,0.0,0.0
+3,pip_dip,0.0,0.29969078302383423,0.0,0.0,0.0,0.0,0.0,0.0
+4,thumb,0.0,0.2966541548569997,0.0,0.0,0.0,0.0,0.0,0.0

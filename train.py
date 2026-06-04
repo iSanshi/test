@@ -34,6 +34,79 @@ def main():
     parser.add_argument("--contact-diversity-scale", type=float, default=None)
     parser.add_argument("--non-fingertip-target-penalty-scale", type=float, default=None)
     parser.add_argument("--action-penalty-scale", type=float, default=None)
+    parser.add_argument(
+        "--use-contact-style-condition",
+        dest="use_contact_style_condition",
+        action="store_true",
+        default=None,
+        help="Append a contact-style one-hot to observations.",
+    )
+    parser.add_argument(
+        "--no-contact-style-condition",
+        dest="use_contact_style_condition",
+        action="store_false",
+        help="Disable contact-style observation conditioning.",
+    )
+    parser.add_argument("--fixed-contact-style", type=int, default=-1)
+    parser.add_argument(
+        "--contact-style-bonus-scale",
+        type=float,
+        default=5.0,
+        help="Final reward weight for selected-style target contact.",
+    )
+    parser.add_argument(
+        "--contact-style-progress-bonus-scale",
+        type=float,
+        default=80.0,
+        help="Final reward weight for selected-style contact times target progress.",
+    )
+    parser.add_argument(
+        "--wrong-style-contact-penalty-scale",
+        type=float,
+        default=0.5,
+        help="Final reward weight for off-style target contacts. The term itself is negative.",
+    )
+    parser.add_argument(
+        "--use-link-contact-diversity-reward",
+        dest="use_link_contact_diversity_reward",
+        action="store_true",
+        default=None,
+        help="Blend link-level and fingertip-level diversity rewards.",
+    )
+    parser.add_argument(
+        "--no-link-contact-diversity-reward",
+        dest="use_link_contact_diversity_reward",
+        action="store_false",
+        help="Use fingertip-level diversity reward only.",
+    )
+    parser.add_argument("--link-contact-diversity-alpha", type=float, default=0.7)
+    parser.add_argument("--finger-contact-diversity-alpha", type=float, default=0.3)
+    parser.add_argument("--contact-diversity-requires-progress", action="store_true")
+    parser.add_argument("--contact-style-requires-progress", action="store_true")
+    parser.add_argument(
+        "--failed-penalty-scale",
+        type=float,
+        default=-200.0,
+        help="Final reward weight for failure. Usually negative.",
+    )
+    parser.add_argument(
+        "--non-target-arm-contact-penalty-scale",
+        type=float,
+        default=5.0,
+        help="Final reward weight for arm/wrist contact with non-target objects. The term itself is negative.",
+    )
+    parser.add_argument(
+        "--randomize-finger-qpos-on-reset",
+        dest="randomize_finger_qpos_on_reset",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-randomize-finger-qpos-on-reset",
+        dest="randomize_finger_qpos_on_reset",
+        action="store_false",
+    )
+    parser.add_argument("--finger-qpos-noise-scale", type=float, default=None)
     parser.add_argument("--use-ppo-curiosity", action="store_true")
     parser.add_argument(
         "--curiosity-model-type",
@@ -82,6 +155,24 @@ def main():
         overrides["force_scale"] = args.force_scale
     if args.torque_scale is not None:
         overrides["torque_scale"] = args.torque_scale
+    if args.use_contact_style_condition is not None:
+        overrides["use_contact_style_condition"] = args.use_contact_style_condition
+    if args.fixed_contact_style is not None:
+        overrides["fixed_contact_style"] = args.fixed_contact_style
+    if args.use_link_contact_diversity_reward is not None:
+        overrides["use_link_contact_diversity_reward"] = args.use_link_contact_diversity_reward
+    if args.link_contact_diversity_alpha is not None:
+        overrides["link_contact_diversity_alpha"] = args.link_contact_diversity_alpha
+    if args.finger_contact_diversity_alpha is not None:
+        overrides["finger_contact_diversity_alpha"] = args.finger_contact_diversity_alpha
+    if args.contact_diversity_requires_progress:
+        overrides["contact_diversity_requires_progress"] = True
+    if args.contact_style_requires_progress:
+        overrides["contact_style_requires_progress"] = True
+    if args.randomize_finger_qpos_on_reset is not None:
+        overrides["randomize_finger_qpos_on_reset"] = args.randomize_finger_qpos_on_reset
+    if args.finger_qpos_noise_scale is not None:
+        overrides["finger_qpos_noise_scale"] = args.finger_qpos_noise_scale
     env_cfg = make_cfg(**overrides)
     reward_cfg = default_reward_cfg()
     if args.reach_curiosity_scale is not None:
@@ -94,6 +185,16 @@ def main():
         reward_cfg["non_fingertip_target_penalty"] = args.non_fingertip_target_penalty_scale
     if args.action_penalty_scale is not None:
         reward_cfg["action_penalty"] = args.action_penalty_scale
+    if args.contact_style_bonus_scale is not None:
+        reward_cfg["contact_style_bonus"] = args.contact_style_bonus_scale
+    if args.contact_style_progress_bonus_scale is not None:
+        reward_cfg["contact_style_progress_bonus"] = args.contact_style_progress_bonus_scale
+    if args.wrong_style_contact_penalty_scale is not None:
+        reward_cfg["wrong_style_contact_penalty"] = args.wrong_style_contact_penalty_scale
+    if args.failed_penalty_scale is not None:
+        reward_cfg["failed"] = args.failed_penalty_scale
+    if args.non_target_arm_contact_penalty_scale is not None:
+        reward_cfg["non_target_arm_contact_penalty"] = args.non_target_arm_contact_penalty_scale
     train_cfg = default_train_cfg(args.exp_name)
     train_cfg["save_interval"] = args.save_interval
     train_cfg["algorithm"]["curiosity_cfg"].update(

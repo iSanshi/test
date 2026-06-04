@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_NAME="${RUN_NAME:-leap_singulation_genesis_finger_diverse}"
+RUN_NAME="${RUN_NAME:-leap_singulation_genesis_style_conditioned_v1}"
 BACKEND="${BACKEND:-gpu}"
 NUM_ENVS="${NUM_ENVS:-4}"
 ACTION_NOISE="${ACTION_NOISE:-0.08}"
@@ -40,4 +40,5 @@ exec "${ROOT_DIR}/scripts/eval.sh" \
   --action-noise "${ACTION_NOISE}" \
   --reset-interval "${RESET_INTERVAL}" \
   --sleep "${SLEEP}" \
+  --use-contact-style-condition \
   "$@"

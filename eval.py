@@ -22,6 +22,18 @@ def main():
     parser.add_argument("--action-noise", type=float, default=0.0)
     parser.add_argument("--sleep", type=float, default=0.0)
     parser.add_argument(
+        "--use-contact-style-condition",
+        dest="use_contact_style_condition",
+        action="store_true",
+        default=None,
+    )
+    parser.add_argument(
+        "--no-contact-style-condition",
+        dest="use_contact_style_condition",
+        action="store_false",
+    )
+    parser.add_argument("--fixed-contact-style", type=int, default=None)
+    parser.add_argument(
         "--reset-interval",
         type=int,
         default=0,
@@ -40,6 +52,17 @@ def main():
         env_cfg, reward_cfg, train_cfg = pickle.load(f)
     env_cfg.num_envs = args.num_envs
     env_cfg.show_viewer = args.viewer and not args.headless
+    checkpoint_has_style_cfg = hasattr(env_cfg, "use_contact_style_condition")
+    if args.use_contact_style_condition is not None:
+        env_cfg.use_contact_style_condition = args.use_contact_style_condition
+    elif not checkpoint_has_style_cfg:
+        env_cfg.use_contact_style_condition = False
+    if args.fixed_contact_style is not None:
+        env_cfg.fixed_contact_style = args.fixed_contact_style
+        if args.fixed_contact_style >= 0:
+            env_cfg.use_contact_style_condition = True
+    if getattr(env_cfg, "use_contact_style_condition", False):
+        print(f"Using fixed_contact_style={getattr(env_cfg, 'fixed_contact_style', -1)}")
 
     env = LeapSingulationGenesisEnv(env_cfg, reward_cfg=reward_cfg)
     runner = OnPolicyRunner(env, train_cfg, ckpt.parent, device=gs.device)

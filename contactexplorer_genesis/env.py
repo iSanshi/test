@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Iterable
 
 import torch
+import torch.nn.functional as F
 from tensordict import TensorDict
 
 import genesis as gs
@@ -51,6 +52,16 @@ LEAP_CONTACT_DIVERSITY_LINKS = [
     "thumb_fingertip",
     "thumb_tip_head",
 ]
+
+LEAP_CONTACT_STYLE_LINK_GROUPS = {
+    "fingertip": ("fingertip", "fingertip_2", "fingertip_3", "thumb_fingertip"),
+    "palm": ("palm_lower",),
+    "mcp": ("mcp_joint", "mcp_joint_2", "mcp_joint_3", "thumb_temp_base"),
+    "pip_dip": ("pip", "pip_2", "pip_3", "dip", "dip_2", "dip_3", "thumb_pip", "thumb_dip"),
+    "thumb": ("thumb_fingertip", "thumb_dip", "thumb_pip"),
+}
+
+LEAP_CONTACT_STYLE_NAMES = tuple(LEAP_CONTACT_STYLE_LINK_GROUPS.keys())
 
 
 @dataclass
@@ -134,6 +145,22 @@ class LeapSingulationGenesisConfig:
     seed: int = 1
     show_viewer: bool = False
     randomize_object_positions: bool = True
+    use_contact_style_condition: bool = True
+    num_contact_styles: int = 5
+    fixed_contact_style: int = -1
+    contact_style_requires_task_gate: bool = True
+    contact_style_requires_progress: bool = False
+    contact_style_progress_threshold: float = 1e-4
+    use_link_contact_diversity_reward: bool = True
+    link_contact_diversity_alpha: float = 0.7
+    finger_contact_diversity_alpha: float = 0.3
+    contact_diversity_requires_task_gate: bool = True
+    contact_diversity_requires_progress: bool = False
+    contact_diversity_progress_threshold: float = 1e-4
+    log_per_link_contacts: bool = True
+    log_per_style_contacts: bool = True
+    randomize_finger_qpos_on_reset: bool = True
+    finger_qpos_noise_scale: float = 0.10
 
 
 def default_assets_dir() -> Path:
@@ -159,6 +186,14 @@ class LeapSingulationGenesisEnv:
 
     def __init__(self, cfg: LeapSingulationGenesisConfig, reward_cfg: dict[str, float] | None = None):
         self.cfg = cfg
+        for cfg_field in fields(LeapSingulationGenesisConfig):
+            if not hasattr(self.cfg, cfg_field.name):
+                setattr(self.cfg, cfg_field.name, cfg_field.default)
+        self.cfg.num_contact_styles = min(int(self.cfg.num_contact_styles), len(LEAP_CONTACT_STYLE_NAMES))
+        if self.cfg.fixed_contact_style >= self.cfg.num_contact_styles:
+            raise ValueError(
+                f"fixed_contact_style={self.cfg.fixed_contact_style} must be < num_contact_styles={self.cfg.num_contact_styles}"
+            )
         self.num_envs = int(cfg.num_envs)
         self.num_actions = int(cfg.num_actions)
         self.device = gs.device
@@ -248,6 +283,7 @@ class LeapSingulationGenesisEnv:
 
         self._setup_robot_handles()
         self._setup_link_indices()
+        self._setup_contact_style_indices()
         self._setup_contact_sensors()
         self._setup_robot_control()
 
@@ -292,6 +328,18 @@ class LeapSingulationGenesisEnv:
         self.current_targets = self.default_qpos.unsqueeze(0).repeat(self.num_envs, 1)
         self.arm_dofs_idx = list(range(min(6, self.robot_dof_dim)))
         self.finger_dofs_idx = list(range(6, self.control_dim))
+        self.dof_lower_limits = None
+        self.dof_upper_limits = None
+        try:
+            lower, upper = self.robot.get_dofs_limit()
+            if lower.ndim > 1:
+                lower = lower[0]
+            if upper.ndim > 1:
+                upper = upper[0]
+            self.dof_lower_limits = lower.to(device=self.device, dtype=gs.tc_float)
+            self.dof_upper_limits = upper.to(device=self.device, dtype=gs.tc_float)
+        except Exception:
+            pass
         self.default_eef_quat = self._link_quat(self.eef_link)
         self.current_eef_quat = self.default_eef_quat.clone()
 
@@ -352,6 +400,39 @@ class LeapSingulationGenesisEnv:
             device=self.device,
         )
 
+    def _setup_contact_style_indices(self) -> None:
+        self.contact_style_names = LEAP_CONTACT_STYLE_NAMES[: self.cfg.num_contact_styles]
+        diversity_local_by_name = {
+            getattr(link, "name", ""): i for i, link in enumerate(self.contact_diversity_links)
+        }
+        self.contact_style_link_indices = []
+        self.contact_style_local_indices = []
+        self.contact_style_missing_links: dict[str, tuple[str, ...]] = {}
+
+        for style_name in self.contact_style_names:
+            global_ids = []
+            local_ids = []
+            missing = []
+            for link_name in LEAP_CONTACT_STYLE_LINK_GROUPS[style_name]:
+                link = self._get_link_or_none(link_name)
+                if link is None:
+                    missing.append(link_name)
+                    continue
+                global_ids.append(int(link.idx))
+                if link_name in diversity_local_by_name:
+                    local_ids.append(int(diversity_local_by_name[link_name]))
+            self.contact_style_link_indices.append(
+                torch.tensor(global_ids, dtype=gs.tc_int, device=self.device)
+            )
+            self.contact_style_local_indices.append(
+                torch.tensor(local_ids, dtype=torch.long, device=self.device)
+            )
+            if missing:
+                self.contact_style_missing_links[style_name] = tuple(missing)
+
+        if self.contact_style_missing_links:
+            print(f">>> Missing contact style links skipped: {self.contact_style_missing_links}")
+
     def _setup_contact_sensors(self) -> None:
         self.contact_sensors = []
         if not hasattr(gs, "sensors"):
@@ -385,6 +466,22 @@ class LeapSingulationGenesisEnv:
         self.reset_buf = torch.ones(self.num_envs, dtype=gs.tc_bool, device=self.device)
         self.last_actions = torch.zeros((self.num_envs, self.num_actions), dtype=gs.tc_float, device=self.device)
         self.prev_actions = torch.zeros_like(self.last_actions)
+        self.contact_style_id = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.contact_style_onehot = torch.zeros(
+            (self.num_envs, self.cfg.num_contact_styles),
+            dtype=gs.tc_float,
+            device=self.device,
+        )
+        self.episode_style_contact_counts = torch.zeros(
+            (self.num_envs, self.cfg.num_contact_styles),
+            dtype=gs.tc_float,
+            device=self.device,
+        )
+        self.episode_selected_style_contact_counts = torch.zeros(
+            self.num_envs,
+            dtype=gs.tc_float,
+            device=self.device,
+        )
         self.goal_pos = torch.tensor(self.cfg.goal_pos, dtype=gs.tc_float, device=self.device).repeat(self.num_envs, 1)
         self.initial_target_pos = torch.zeros((self.num_envs, 3), dtype=gs.tc_float, device=self.device)
         self.initial_neighbor_pos = torch.zeros((self.num_envs, self.cfg.num_objects - 1, 3), dtype=gs.tc_float, device=self.device)
@@ -533,6 +630,8 @@ class LeapSingulationGenesisEnv:
             ],
             dim=-1,
         )
+        if self.cfg.use_contact_style_condition:
+            obs = torch.cat([obs, self.contact_style_onehot], dim=-1)
         self.obs_buf = obs
         self.num_obs = int(obs.shape[-1])
         return TensorDict({"policy": obs}, batch_size=[self.num_envs])
@@ -549,8 +648,45 @@ class LeapSingulationGenesisEnv:
         if n == 0:
             return
 
-        self.robot.set_qpos(self.default_qpos, envs_idx=envs_idx, zero_velocity=True, skip_forward=True)
-        self.current_targets[envs_idx] = self.default_qpos
+        env_ids = envs_idx.nonzero(as_tuple=False).flatten()
+        reset_qpos = self.default_qpos.unsqueeze(0).repeat(n, 1)
+        if self.cfg.randomize_finger_qpos_on_reset and self.finger_dofs_idx:
+            scale = float(self.cfg.finger_qpos_noise_scale)
+            noise = (torch.rand((n, len(self.finger_dofs_idx)), dtype=gs.tc_float, device=self.device) * 2.0 - 1.0) * scale
+            reset_qpos[:, self.finger_dofs_idx] += noise
+            max_finger_dof = max(self.finger_dofs_idx)
+            if (
+                self.dof_lower_limits is not None
+                and self.dof_upper_limits is not None
+                and self.dof_lower_limits.numel() > max_finger_dof
+                and self.dof_upper_limits.numel() > max_finger_dof
+            ):
+                lower = self.dof_lower_limits[self.finger_dofs_idx].unsqueeze(0)
+                upper = self.dof_upper_limits[self.finger_dofs_idx].unsqueeze(0)
+                reset_qpos[:, self.finger_dofs_idx] = torch.clamp(reset_qpos[:, self.finger_dofs_idx], lower, upper)
+
+        self.robot.set_qpos(reset_qpos, envs_idx=env_ids, zero_velocity=True, skip_forward=True)
+        self.current_targets[envs_idx] = reset_qpos
+
+        if self.cfg.use_contact_style_condition:
+            if self.cfg.fixed_contact_style >= 0:
+                new_style = torch.full((n,), int(self.cfg.fixed_contact_style), dtype=torch.long, device=self.device)
+            else:
+                new_style = torch.randint(
+                    0,
+                    int(self.cfg.num_contact_styles),
+                    (n,),
+                    dtype=torch.long,
+                    device=self.device,
+                )
+            self.contact_style_id[envs_idx] = new_style
+            self.contact_style_onehot[envs_idx] = F.one_hot(
+                new_style,
+                num_classes=int(self.cfg.num_contact_styles),
+            ).to(dtype=gs.tc_float)
+        else:
+            self.contact_style_id[envs_idx] = 0
+            self.contact_style_onehot[envs_idx] = 0.0
 
         base = torch.tensor(
             [
@@ -570,7 +706,6 @@ class LeapSingulationGenesisEnv:
             noise = torch.zeros((n, self.cfg.num_objects, 3), dtype=gs.tc_float, device=self.device)
         obj_pos = base.unsqueeze(0) + noise
 
-        env_ids = envs_idx.nonzero(as_tuple=False).flatten()
         for i, obj in enumerate(self.objects):
             pos_i = obj_pos[:, i, :]
             obj.set_pos(pos_i, envs_idx=env_ids, skip_forward=True)
@@ -594,6 +729,8 @@ class LeapSingulationGenesisEnv:
         self.episode_fingertip_cluster_counts[envs_idx] = 0.0
         self.episode_contact_link_counts[envs_idx] = 0.0
         self.episode_contact_link_cluster_counts[envs_idx] = 0.0
+        self.episode_style_contact_counts[envs_idx] = 0.0
+        self.episode_selected_style_contact_counts[envs_idx] = 0.0
         self.potential_per_kp_max[envs_idx] = 0.0
         self.contact_coverage_per_kp_max[envs_idx] = 0.0
         self.current_eef_quat[envs_idx] = self.default_eef_quat[envs_idx]
@@ -633,6 +770,37 @@ class LeapSingulationGenesisEnv:
         self.failed = failed
         coverage_reward, coverage_info = self._compute_contact_coverage_reward(self.contact_info)
         reach_curiosity = coverage_info["reach_curiosity_rew"]
+        task_gate = (
+            self.contact_info["hand_target_contact"]
+            & self.contact_info["env_detach"]
+            & (~self.contact_info["non_target_arm_contact"])
+        )
+        progress_gate = progress > float(self.cfg.contact_style_progress_threshold)
+        diversity_progress_gate = progress > float(self.cfg.contact_diversity_progress_threshold)
+        if self.cfg.contact_diversity_requires_task_gate:
+            coverage_info["contact_diversity_reward"] = coverage_info["contact_diversity_reward"] * task_gate.float()
+        if self.cfg.contact_diversity_requires_progress:
+            coverage_info["contact_diversity_reward"] = (
+                coverage_info["contact_diversity_reward"] * diversity_progress_gate.float()
+            )
+
+        style_info = self._compute_style_contact_info(self.contact_info)
+        selected_style_contact = style_info["selected_style_contact"]
+        wrong_style_contact = style_info["wrong_style_contact"]
+        style_contact_bonus = selected_style_contact.float()
+        style_progress_bonus = selected_style_contact.float() * progress
+        wrong_style_contact_penalty = -wrong_style_contact.float()
+        if not self.cfg.use_contact_style_condition:
+            style_contact_bonus = torch.zeros_like(style_contact_bonus)
+            style_progress_bonus = torch.zeros_like(style_progress_bonus)
+            wrong_style_contact_penalty = torch.zeros_like(wrong_style_contact_penalty)
+        if self.cfg.contact_style_requires_task_gate:
+            style_contact_bonus = style_contact_bonus * task_gate.float()
+            style_progress_bonus = style_progress_bonus * task_gate.float()
+            wrong_style_contact_penalty = wrong_style_contact_penalty * task_gate.float()
+        if self.cfg.contact_style_requires_progress:
+            style_contact_bonus = style_contact_bonus * progress_gate.float()
+        non_target_arm_contact_penalty = -self.contact_info["non_target_arm_contact"].float()
 
         terms = {
             "goal_dist": goal_dist.detach(),
@@ -648,8 +816,15 @@ class LeapSingulationGenesisEnv:
             "non_fingertip_target_penalty": non_fingertip_target_penalty,
             "success": success,
             "near_goal_bonus": near_goal.float(),
+            "contact_style_bonus": style_contact_bonus,
+            "contact_style_progress_bonus": style_progress_bonus,
+            "wrong_style_contact_penalty": wrong_style_contact_penalty,
+            "task_gate": task_gate.float(),
+            "progress_gate": progress_gate.float(),
+            "non_target_arm_contact_penalty": non_target_arm_contact_penalty,
             **coverage_info,
             **self.contact_info,
+            **style_info,
             "near_goal": near_goal.float(),
             "near_goal_steps": self.near_goal_steps.float(),
             "successes": self.successes,
@@ -668,6 +843,11 @@ class LeapSingulationGenesisEnv:
             + self.reward_cfg.get("non_fingertip_target_penalty", 0.0) * non_fingertip_target_penalty
             + self.reward_cfg["near_goal_bonus"] * near_goal.float()
             + self.reward_cfg["success"] * success
+            + self.reward_cfg.get("contact_style_bonus", 0.0) * style_contact_bonus
+            + self.reward_cfg.get("contact_style_progress_bonus", 0.0) * style_progress_bonus
+            + self.reward_cfg.get("wrong_style_contact_penalty", 0.0) * wrong_style_contact_penalty
+            + self.reward_cfg.get("failed", 0.0) * failed.float()
+            + self.reward_cfg.get("non_target_arm_contact_penalty", 0.0) * non_target_arm_contact_penalty
         )
         return reward, terms
 
@@ -830,6 +1010,41 @@ class LeapSingulationGenesisEnv:
             "contact_diversity_force_norm": contact_diversity_force_norm,
         }
 
+    def _compute_style_contact_info(self, contact_info: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        style_contact_matrix = torch.zeros(
+            (self.num_envs, self.cfg.num_contact_styles),
+            dtype=gs.tc_bool,
+            device=self.device,
+        )
+        diversity_mask = contact_info.get("contact_diversity_mask")
+        if torch.is_tensor(diversity_mask) and diversity_mask.ndim == 2 and diversity_mask.shape[1] > 0:
+            for style_id, local_indices in enumerate(self.contact_style_local_indices[: self.cfg.num_contact_styles]):
+                if local_indices.numel() > 0:
+                    style_contact_matrix[:, style_id] = diversity_mask.index_select(1, local_indices).any(dim=1)
+
+        if self.cfg.use_contact_style_condition:
+            selected_style = self.contact_style_id.clamp(0, self.cfg.num_contact_styles - 1)
+        else:
+            selected_style = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        selected_style_contact = style_contact_matrix.gather(1, selected_style.view(-1, 1)).squeeze(1)
+        selected_onehot = F.one_hot(selected_style, num_classes=self.cfg.num_contact_styles).to(dtype=gs.tc_bool)
+        wrong_style_contact = (style_contact_matrix & ~selected_onehot).any(dim=1)
+
+        self.episode_style_contact_counts += style_contact_matrix.float()
+        self.episode_selected_style_contact_counts += selected_style_contact.float()
+
+        info: dict[str, torch.Tensor] = {
+            "style_contact_matrix": style_contact_matrix,
+            "selected_style_contact": selected_style_contact,
+            "wrong_style_contact": wrong_style_contact,
+            "selected_contact_style": selected_style.to(dtype=gs.tc_float),
+            "episode_selected_style_contact_count": self.episode_selected_style_contact_counts,
+        }
+        for style_id in range(self.cfg.num_contact_styles):
+            info[f"style_{style_id}_contact"] = style_contact_matrix[:, style_id].float()
+            info[f"episode_style_{style_id}_contact_count"] = self.episode_style_contact_counts[:, style_id]
+        return info
+
     def _empty_contact_info(self) -> dict[str, torch.Tensor]:
         zeros = torch.zeros(self.num_envs, dtype=gs.tc_float, device=self.device)
         bools = torch.zeros(self.num_envs, dtype=gs.tc_bool, device=self.device)
@@ -965,6 +1180,16 @@ class LeapSingulationGenesisEnv:
                 "reach_curiosity_rew": zeros,
                 "avg_potential": zeros,
                 "cluster_novelty_reward": zeros,
+                "new_episode_contact_reward": zeros,
+                "new_finger_cluster_contact_reward": zeros,
+                "new_link_cluster_contact_reward": zeros,
+                "finger_diversity_reward": zeros,
+                "link_diversity_reward": zeros,
+                "contact_diversity_reward": zeros,
+                "finger_contact_entropy": zeros,
+                "current_finger_contact_entropy": zeros,
+                "link_contact_entropy": zeros,
+                "current_link_contact_entropy": zeros,
                 "stateid_entropy": zeros,
             }
 
@@ -1131,7 +1356,15 @@ class LeapSingulationGenesisEnv:
         link_contact_entropy = self._coverage_entropy(self.episode_contact_link_counts)
         current_link_contact_entropy = self._coverage_entropy(diversity_contact_mask.float())
         link_contact_count = diversity_contact_mask.sum(dim=1).float()
-        contact_diversity_reward = new_episode_contact_reward + 0.25 * finger_contact_entropy
+        finger_diversity_reward = new_episode_contact_reward + 0.25 * finger_contact_entropy
+        link_diversity_reward = new_link_cluster_contact_reward + 0.25 * current_link_contact_entropy
+        if self.cfg.use_link_contact_diversity_reward:
+            contact_diversity_reward = (
+                float(self.cfg.link_contact_diversity_alpha) * link_diversity_reward
+                + float(self.cfg.finger_contact_diversity_alpha) * finger_diversity_reward
+            )
+        else:
+            contact_diversity_reward = finger_diversity_reward
         return novelty_reward, {
             "reach_curiosity_rew": potential_reward,
             "avg_potential": phi.mean(dim=-1),
@@ -1141,6 +1374,8 @@ class LeapSingulationGenesisEnv:
             "new_episode_contact_reward": new_episode_contact_reward,
             "new_finger_cluster_contact_reward": new_episode_contact_reward,
             "new_link_cluster_contact_reward": new_link_cluster_contact_reward,
+            "finger_diversity_reward": finger_diversity_reward,
+            "link_diversity_reward": link_diversity_reward,
             "finger_contact_entropy": finger_contact_entropy,
             "current_finger_contact_entropy": current_finger_contact_entropy,
             "link_contact_entropy": link_contact_entropy,
@@ -1153,6 +1388,8 @@ class LeapSingulationGenesisEnv:
         }
 
     def _coverage_entropy(self, counts: torch.Tensor) -> torch.Tensor:
+        if counts.shape[-1] <= 1:
+            return torch.zeros(counts.shape[0], dtype=gs.tc_float, device=self.device)
         probs = counts / counts.sum(dim=-1, keepdim=True).clamp_min(1.0)
         entropy = -(probs * torch.log(probs.clamp_min(1e-6))).sum(dim=-1)
         return entropy / math.log(float(counts.shape[-1]))
@@ -1251,7 +1488,10 @@ class LeapSingulationGenesisEnv:
 
     def _infer_curiosity_state_dim(self) -> int:
         if self.cfg.curiosity_state_type == "policy_state":
-            return self.robot_q_dim + self.robot_q_dim + 3 + 3 + 4 + 3 + 12 + 1 + 4 + self.num_actions
+            dim = self.robot_q_dim + self.robot_q_dim + 3 + 3 + 4 + 3 + 12 + 1 + 4 + self.num_actions
+            if self.cfg.use_contact_style_condition:
+                dim += self.cfg.num_contact_styles
+            return dim
         if self.cfg.curiosity_state_type == "contact_force":
             return len(LEAP_FINGERTIP_LINKS)
         if self.cfg.curiosity_state_type == "contact_distance":
@@ -1449,21 +1689,35 @@ class LeapSingulationGenesisEnv:
             if tensor.ndim > 1:
                 tensor = tensor.reshape(self.num_envs, -1).mean(dim=-1)
             logs[f"rew_{key}"] = tensor.mean()
+        if self.cfg.log_per_link_contacts:
+            link_mask = terms.get("contact_diversity_mask")
+            if torch.is_tensor(link_mask) and link_mask.ndim == 2:
+                link_mask = link_mask.detach().float()
+                for link_id, link in enumerate(self.contact_diversity_links):
+                    if link_id >= link_mask.shape[1]:
+                        break
+                    name = getattr(link, "name", f"link_{link_id}")
+                    logs[f"contact_link/{name}"] = link_mask[:, link_id].mean()
         return logs
 
 
 def default_reward_cfg() -> dict[str, float]:
     return {
-        "target_progress": 60.0,
-        "reach": 0.5,
+        "target_progress": 100.0,
+        "reach": 1.0,
         "reach_curiosity": 1.28,
-        "contact_coverage": 200.0,
-        "contact_diversity": 0.0,
+        "contact_coverage": 100.0,
+        "contact_diversity": 20.0,
+        "contact_style_bonus": 5.0,
+        "contact_style_progress_bonus": 80.0,
+        "wrong_style_contact_penalty": 0.5,
+        "failed": -200.0,
+        "non_target_arm_contact_penalty": 5.0,
         "non_fingertip_target_penalty": 0.0,
-        "neighbor_stability": 5.0,
-        "action_penalty": 0.005,
-        "near_goal_bonus": 10.0,
-        "success": 4000.0,
+        "neighbor_stability": 10.0,
+        "action_penalty": 0.02,
+        "near_goal_bonus": 20.0,
+        "success": 3000.0,
     }
 
 
